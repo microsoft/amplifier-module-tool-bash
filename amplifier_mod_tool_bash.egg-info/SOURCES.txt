@@ -1,0 +1,9 @@
+LICENSE
+pyproject.toml
+amplifier_mod_tool_bash/__init__.py
+amplifier_mod_tool_bash.egg-info/PKG-INFO
+amplifier_mod_tool_bash.egg-info/SOURCES.txt
+amplifier_mod_tool_bash.egg-info/dependency_links.txt
+amplifier_mod_tool_bash.egg-info/entry_points.txt
+amplifier_mod_tool_bash.egg-info/requires.txt
+amplifier_mod_tool_bash.egg-info/top_level.txt
