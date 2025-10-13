@@ -2,6 +2,20 @@
 
 Shell command execution for Amplifier agents.
 
+## Prerequisites
+
+- **Python 3.11+**
+- **[UV](https://github.com/astral-sh/uv)** - Fast Python package manager
+
+### Installing UV
+
+```bash
+# macOS/Linux/WSL
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
 ## Purpose
 
 Enables agents to execute bash commands in a controlled environment for system interactions, build operations, and automation tasks.
