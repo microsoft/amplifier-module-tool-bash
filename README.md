@@ -21,6 +21,10 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
 Enables agents to execute bash commands in a controlled environment for system interactions, build operations, and automation tasks.
 
+**Platform Behavior:**
+- **Linux/macOS/WSL**: Full bash shell with all features (pipes, redirects, &&, ||, ~, $VAR, etc.)
+- **Windows**: Limited to simple commands without shell operators (use full paths)
+
 ## Contract
 
 **Module Type:** Tool
@@ -31,7 +35,7 @@ Enables agents to execute bash commands in a controlled environment for system i
 
 ### `bash`
 
-Execute a bash command.
+Execute a bash command with platform-appropriate shell.
 
 **Input:**
 
@@ -40,9 +44,27 @@ Execute a bash command.
 
 **Output:**
 
-- Command output (stdout/stderr combined)
-- Exit code
-- Timeout indication if applicable
+- `stdout`: Standard output from command
+- `stderr`: Standard error from command
+- `returncode`: Exit code (0 = success)
+
+**Platform Support:**
+
+**Unix-like (Linux, macOS, WSL)**:
+- ✅ Full bash shell (`/bin/bash`)
+- ✅ Pipes: `ls | grep foo`
+- ✅ Operators: `cmd1 && cmd2`, `cmd1 || cmd2`
+- ✅ Redirects: `cmd > file`, `cmd 2>&1`, `cmd &> file`
+- ✅ Tilde expansion: `~/.amplifier`
+- ✅ Variables: `$HOME`, `${VAR}`
+- ✅ Command substitution: `$(pwd)`, `` `date` ``
+- ✅ Heredocs: `cat <<EOF`
+
+**Windows (native)**:
+- ⚠️ Limited to simple commands
+- ❌ Shell operators not supported
+- 💡 Use full paths: `C:\Users\...` not `~`
+- 💡 For shell features, use WSL
 
 ## Configuration
 

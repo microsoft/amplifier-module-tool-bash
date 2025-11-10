@@ -6,6 +6,7 @@ Includes safety features and approval mechanisms.
 import asyncio
 import logging
 import shlex
+import sys
 from typing import Any
 
 from amplifier_core import ModuleCoordinator
@@ -304,17 +305,54 @@ Important:
         return False
 
     async def _run_command(self, command: str) -> dict[str, Any]:
-        """Run command asynchronously."""
-        # Parse command
-        try:
-            args = shlex.split(command)
-        except ValueError as e:
-            raise ValueError(f"Invalid command syntax: {e}")
+        """Run command asynchronously with platform-appropriate shell.
 
-        # Run command
-        process = await asyncio.create_subprocess_exec(
-            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=self.working_dir
-        )
+        On Unix-like systems (Linux, macOS, WSL), uses bash for full shell features.
+        On Windows, uses cmd.exe with limitations on shell operators.
+        """
+        # Detect platform
+        is_windows = sys.platform == "win32"
+
+        if is_windows:
+            # Windows: Check for shell features that won't work in cmd.exe
+            shell_features = ["|", "&&", "||", "~", ">", "<", "2>&1", "$(", "`"]
+            if any(feature in command for feature in shell_features):
+                return {
+                    "stdout": "",
+                    "stderr": (
+                        "Shell features like |, &&, ||, ~, redirects are not fully supported on Windows.\n"
+                        "Use full paths (e.g., C:\\Users\\...) and simple commands.\n"
+                        "For complex operations, consider using WSL."
+                    ),
+                    "returncode": 1,
+                }
+
+            # Windows: Use direct execution (no shell)
+            try:
+                args = shlex.split(command)
+            except ValueError as e:
+                raise ValueError(f"Invalid command syntax: {e}")
+
+            process = await asyncio.create_subprocess_exec(
+                *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=self.working_dir
+            )
+        else:
+            # Unix-like (Linux, macOS, WSL): Use real bash shell
+            # This enables:
+            # - Tilde expansion (~)
+            # - Shell operators (&&, ||, |, ;)
+            # - Redirects (>, <, 2>&1, &>)
+            # - Command substitution ($(...), `...`)
+            # - Variable expansion ($VAR)
+            # - Heredocs (<<EOF)
+
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                executable="/bin/bash",  # Explicit bash (not /bin/sh)
+                cwd=self.working_dir,
+            )
 
         # Wait for completion with timeout
         try:
