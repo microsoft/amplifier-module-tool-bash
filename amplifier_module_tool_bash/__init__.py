@@ -6,6 +6,7 @@ Includes safety features and approval mechanisms.
 import asyncio
 import logging
 import shlex
+import shutil
 import sys
 from typing import Any
 
@@ -308,34 +309,55 @@ Important:
         """Run command asynchronously with platform-appropriate shell.
 
         On Unix-like systems (Linux, macOS, WSL), uses bash for full shell features.
-        On Windows, uses cmd.exe with limitations on shell operators.
+        On Windows, attempts to find bash (Git Bash or WSL bash).
+        Falls back to cmd.exe with limitations if bash is not found.
         """
         # Detect platform
         is_windows = sys.platform == "win32"
 
         if is_windows:
-            # Windows: Check for shell features that won't work in cmd.exe
-            shell_features = ["|", "&&", "||", "~", ">", "<", "2>&1", "$(", "`"]
-            if any(feature in command for feature in shell_features):
-                return {
-                    "stdout": "",
-                    "stderr": (
-                        "Shell features like |, &&, ||, ~, redirects are not fully supported on Windows.\n"
-                        "Use full paths (e.g., C:\\Users\\...) and simple commands.\n"
-                        "For complex operations, consider using WSL."
-                    ),
-                    "returncode": 1,
-                }
+            # Try to find bash (Git Bash or WSL bash)
+            bash_exe = shutil.which("bash")
+            
+            if bash_exe:
+                # Bash found on Windows - use it with full shell features
+                process = await asyncio.create_subprocess_shell(
+                    command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    executable=bash_exe,
+                    cwd=self.working_dir,
+                )
+            else:
+                # No bash found - fall back to limited cmd.exe behavior
+                # Check for shell features that won't work in cmd.exe
+                shell_features = ["|", "&&", "||", "~", ">", "<", "2>&1", "$(", "`"]
+                if any(feature in command for feature in shell_features):
+                    return {
+                        "stdout": "",
+                        "stderr": (
+                            "Bash not found in PATH.\n"
+                            "\n"
+                            "Shell features like |, &&, ||, ~, redirects require bash.\n"
+                            "\n"
+                            "Install Git for Windows (includes Git Bash):\n"
+                            "  https://git-scm.com/download/win\n"
+                            "\n"
+                            "Or install WSL:\n"
+                            "  https://learn.microsoft.com/en-us/windows/wsl/install"
+                        ),
+                        "returncode": 1,
+                    }
 
-            # Windows: Use direct execution (no shell)
-            try:
-                args = shlex.split(command)
-            except ValueError as e:
-                raise ValueError(f"Invalid command syntax: {e}")
+                # Windows: Use direct execution (no shell) for simple commands
+                try:
+                    args = shlex.split(command)
+                except ValueError as e:
+                    raise ValueError(f"Invalid command syntax: {e}")
 
-            process = await asyncio.create_subprocess_exec(
-                *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=self.working_dir
-            )
+                process = await asyncio.create_subprocess_exec(
+                    *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=self.working_dir
+                )
         else:
             # Unix-like (Linux, macOS, WSL): Use real bash shell
             # This enables:
