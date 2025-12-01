@@ -318,7 +318,7 @@ Important:
         if is_windows:
             # Try to find bash (Git Bash or WSL bash)
             bash_exe = shutil.which("bash")
-            
+
             if bash_exe:
                 # Bash found on Windows - use it with full shell features
                 process = await asyncio.create_subprocess_shell(
