@@ -3,6 +3,9 @@ Bash command execution tool for Amplifier.
 Includes safety features and approval mechanisms.
 """
 
+# Amplifier module metadata
+__amplifier_module_type__ = "tool"
+
 import asyncio
 import logging
 import shlex
