@@ -8,8 +8,10 @@ __amplifier_module_type__ = "tool"
 
 import asyncio
 import logging
+import os
 import shlex
 import shutil
+import signal
 import sys
 from typing import Any
 
@@ -202,7 +204,14 @@ Important:
         """Return JSON schema for tool parameters."""
         return {
             "type": "object",
-            "properties": {"command": {"type": "string", "description": "Bash command to execute"}},
+            "properties": {
+                "command": {"type": "string", "description": "Bash command to execute"},
+                "run_in_background": {
+                    "type": "boolean",
+                    "description": "Run command in background, returning immediately with PID. Use for long-running processes like dev servers.",
+                    "default": False,
+                },
+            },
             "required": ["command"],
         }
 
@@ -222,7 +231,7 @@ Important:
         Execute a bash command.
 
         Args:
-            input: Dictionary with 'command' key
+            input: Dictionary with 'command' and optional 'run_in_background' keys
 
         Returns:
             Tool result with command output
@@ -231,6 +240,8 @@ Important:
         if not command:
             return ToolResult(success=False, error={"message": "Command is required"})
 
+        run_in_background = input.get("run_in_background", False)
+
         # Safety checks
         if not self._is_safe_command(command):
             return ToolResult(success=False, error={"message": f"Command denied for safety: {command}"})
@@ -238,13 +249,24 @@ Important:
         # Approval is now handled by approval hook via tool:pre event
 
         try:
-            # Execute command
-            result = await self._run_command(command)
-
-            return ToolResult(
-                success=result["returncode"] == 0,
-                output={"stdout": result["stdout"], "stderr": result["stderr"], "returncode": result["returncode"]},
-            )
+            if run_in_background:
+                # Execute command in background and return immediately
+                result = await self._run_command_background(command)
+                return ToolResult(
+                    success=True,
+                    output={
+                        "pid": result["pid"],
+                        "message": f"Command started in background with PID {result['pid']}",
+                        "note": "Use 'ps' or 'kill' commands to manage the background process.",
+                    },
+                )
+            else:
+                # Execute command and wait for completion
+                result = await self._run_command(command)
+                return ToolResult(
+                    success=result["returncode"] == 0,
+                    output={"stdout": result["stdout"], "stderr": result["stderr"], "returncode": result["returncode"]},
+                )
 
         except TimeoutError:
             return ToolResult(success=False, error={"message": f"Command timed out after {self.timeout} seconds"})
@@ -308,15 +330,71 @@ Important:
 
         return False
 
+    async def _run_command_background(self, command: str) -> dict[str, Any]:
+        """Run command in background, returning immediately with PID.
+
+        The process is fully detached with:
+        - New session (setsid) so it's not killed when parent exits
+        - Pipes redirected to /dev/null to prevent blocking
+        - Returns immediately with PID for management
+        """
+        is_windows = sys.platform == "win32"
+
+        if is_windows:
+            # Windows background execution
+            bash_exe = shutil.which("bash")
+            if bash_exe:
+                # Use bash with nohup-style detachment
+                process = await asyncio.create_subprocess_shell(
+                    command,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    executable=bash_exe,
+                    cwd=self.working_dir,
+                    creationflags=0x00000008,  # DETACHED_PROCESS on Windows
+                )
+            else:
+                try:
+                    args = shlex.split(command)
+                except ValueError as e:
+                    raise ValueError(f"Invalid command syntax: {e}")
+
+                process = await asyncio.create_subprocess_exec(
+                    *args,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    cwd=self.working_dir,
+                    creationflags=0x00000008,  # DETACHED_PROCESS
+                )
+        else:
+            # Unix-like: Use setsid to create new session, fully detached
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.DEVNULL,
+                executable="/bin/bash",
+                cwd=self.working_dir,
+                start_new_session=True,  # Creates new session, detaches from terminal
+            )
+
+        return {"pid": process.pid}
+
     async def _run_command(self, command: str) -> dict[str, Any]:
         """Run command asynchronously with platform-appropriate shell.
 
         On Unix-like systems (Linux, macOS, WSL), uses bash for full shell features.
         On Windows, attempts to find bash (Git Bash or WSL bash).
         Falls back to cmd.exe with limitations if bash is not found.
+
+        Uses process groups for proper cleanup on timeout - kills entire process tree.
         """
         # Detect platform
         is_windows = sys.platform == "win32"
+        process = None
+        pgid = None
 
         if is_windows:
             # Try to find bash (Git Bash or WSL bash)
@@ -370,6 +448,9 @@ Important:
             # - Command substitution ($(...), `...`)
             # - Variable expansion ($VAR)
             # - Heredocs (<<EOF)
+            #
+            # start_new_session=True creates a new process group, enabling
+            # us to kill the entire process tree on timeout (not just bash)
 
             process = await asyncio.create_subprocess_shell(
                 command,
@@ -377,7 +458,10 @@ Important:
                 stderr=asyncio.subprocess.PIPE,
                 executable="/bin/bash",  # Explicit bash (not /bin/sh)
                 cwd=self.working_dir,
+                start_new_session=True,  # Creates new process group for proper cleanup
             )
+            # Get the process group ID (same as PID when start_new_session=True)
+            pgid = process.pid
 
         # Wait for completion with timeout
         try:
@@ -390,7 +474,30 @@ Important:
             }
 
         except TimeoutError:
-            # Kill the process
-            process.kill()
-            await process.communicate()  # Clean up
+            # Kill the entire process group (all children) on Unix
+            if pgid is not None and not is_windows:
+                try:
+                    # Send SIGTERM to process group first (graceful shutdown)
+                    os.killpg(pgid, signal.SIGTERM)
+                    # Give processes a moment to clean up
+                    await asyncio.sleep(0.5)
+                    # Force kill if still running
+                    try:
+                        os.killpg(pgid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass  # Already terminated
+                except ProcessLookupError:
+                    pass  # Process group already gone
+                except PermissionError:
+                    # Fall back to killing just the main process
+                    process.kill()
+            else:
+                # Windows or no pgid: kill just the main process
+                process.kill()
+
+            # Clean up
+            try:
+                await asyncio.wait_for(process.communicate(), timeout=5)
+            except TimeoutError:
+                pass  # Best effort cleanup
             raise
