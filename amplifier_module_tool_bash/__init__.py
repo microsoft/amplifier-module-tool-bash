@@ -252,8 +252,67 @@ SAFETY:
 
         return False
 
+    def _extract_head_bytes(self, output: str, budget: int) -> str:
+        """Extract first N bytes from output, respecting UTF-8 boundaries.
+
+        Args:
+            output: The string to extract from
+            budget: Maximum bytes to extract
+
+        Returns:
+            String containing at most `budget` bytes, not splitting multi-byte chars
+        """
+        encoded = output.encode("utf-8")
+        if len(encoded) <= budget:
+            return output
+
+        # Truncate at byte level, then decode safely
+        truncated_bytes = encoded[:budget]
+
+        # Find valid UTF-8 boundary by trying to decode
+        # Work backwards until we get valid UTF-8
+        for i in range(len(truncated_bytes), max(0, len(truncated_bytes) - 4), -1):
+            try:
+                return truncated_bytes[:i].decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+
+        # Fallback: decode with error replacement (shouldn't normally happen)
+        return truncated_bytes.decode("utf-8", errors="ignore")
+
+    def _extract_tail_bytes(self, output: str, budget: int) -> str:
+        """Extract last N bytes from output, respecting UTF-8 boundaries.
+
+        Args:
+            output: The string to extract from
+            budget: Maximum bytes to extract
+
+        Returns:
+            String containing at most `budget` bytes, not splitting multi-byte chars
+        """
+        encoded = output.encode("utf-8")
+        if len(encoded) <= budget:
+            return output
+
+        # Truncate at byte level from the end
+        truncated_bytes = encoded[-budget:]
+
+        # Find valid UTF-8 boundary by trying to decode
+        # Work forwards until we get valid UTF-8 (skip partial char at start)
+        for i in range(min(4, len(truncated_bytes))):
+            try:
+                return truncated_bytes[i:].decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+
+        # Fallback: decode with error replacement (shouldn't normally happen)
+        return truncated_bytes.decode("utf-8", errors="ignore")
+
     def _truncate_output(self, output: str) -> tuple[str, bool, int]:
         """Truncate output if it exceeds max_output_bytes.
+
+        Uses line-based truncation for cleaner output, with byte-level fallback
+        for edge cases like single giant lines (minified JSON, base64).
 
         Returns:
             Tuple of (possibly truncated output, was_truncated, original_bytes)
@@ -265,41 +324,64 @@ SAFETY:
 
         # Preserve head and tail with truncation indicator
         # Use roughly 40% head, 40% tail, leaving room for indicator
-        head_bytes = int(self.max_output_bytes * 0.4)
-        tail_bytes = int(self.max_output_bytes * 0.4)
+        head_budget = int(self.max_output_bytes * 0.4)
+        tail_budget = int(self.max_output_bytes * 0.4)
 
         # Split into lines for cleaner truncation
         lines = output.split("\n")
 
-        # Build head (first N lines up to head_bytes)
+        # Build head (first N lines up to head_budget)
         head_lines = []
         head_size = 0
         for line in lines:
             line_bytes = len((line + "\n").encode("utf-8"))
-            if head_size + line_bytes > head_bytes:
+            if head_size + line_bytes > head_budget:
                 break
             head_lines.append(line)
             head_size += line_bytes
 
-        # Build tail (last N lines up to tail_bytes)
+        # Build tail (last N lines up to tail_budget)
         tail_lines = []
         tail_size = 0
         for line in reversed(lines):
             line_bytes = len((line + "\n").encode("utf-8"))
-            if tail_size + line_bytes > tail_bytes:
+            if tail_size + line_bytes > tail_budget:
                 break
             tail_lines.insert(0, line)
             tail_size += line_bytes
 
-        # Compose truncated output
-        truncation_indicator = (
-            f"\n\n[...OUTPUT TRUNCATED...]\n"
-            f"[Showing first {len(head_lines)} lines and last {len(tail_lines)} lines]\n"
-            f"[Total output: {original_bytes:,} bytes, limit: {self.max_output_bytes:,} bytes]\n"
-            f"[TIP: For large structured output (JSON/XML), redirect to file and read portions]\n\n"
-        )
+        head_content = "\n".join(head_lines)
+        tail_content = "\n".join(tail_lines)
 
-        truncated = "\n".join(head_lines) + truncation_indicator + "\n".join(tail_lines)
+        # Check if line-based truncation captured enough content
+        captured_bytes = len(head_content.encode("utf-8")) + len(tail_content.encode("utf-8"))
+        min_useful = self.max_output_bytes * 0.2  # At least 20% of limit
+
+        if captured_bytes < min_useful:
+            # Byte-level fallback for very long lines (minified JSON, base64, etc.)
+            head_content = self._extract_head_bytes(output, head_budget)
+            tail_content = self._extract_tail_bytes(output, tail_budget)
+
+            head_actual_bytes = len(head_content.encode("utf-8"))
+            tail_actual_bytes = len(tail_content.encode("utf-8"))
+
+            truncation_indicator = (
+                f"\n\n[...OUTPUT TRUNCATED (byte-level)...]\n"
+                f"[Showing first ~{head_actual_bytes:,} bytes and last ~{tail_actual_bytes:,} bytes]\n"
+                f"[Total output: {original_bytes:,} bytes, limit: {self.max_output_bytes:,} bytes]\n"
+                f"[Note: Line-based truncation failed (very long lines), using byte-level fallback]\n"
+                f"[TIP: For large structured output, redirect to file and read portions]\n\n"
+            )
+        else:
+            # Standard line-based truncation indicator
+            truncation_indicator = (
+                f"\n\n[...OUTPUT TRUNCATED...]\n"
+                f"[Showing first {len(head_lines)} lines and last {len(tail_lines)} lines]\n"
+                f"[Total output: {original_bytes:,} bytes, limit: {self.max_output_bytes:,} bytes]\n"
+                f"[TIP: For large structured output (JSON/XML), redirect to file and read portions]\n\n"
+            )
+
+        truncated = head_content + truncation_indicator + tail_content
         return truncated, True, original_bytes
 
     async def _run_command_background(self, command: str) -> dict[str, Any]:
