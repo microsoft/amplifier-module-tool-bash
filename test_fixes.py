@@ -86,6 +86,31 @@ async def test_basic_command():
     print("✓ Basic command works")
 
 
+async def test_safety_error_includes_reason():
+    """Test that safety rejection error message includes the specific reason."""
+    print("\n=== Test 1b: Safety error includes rejection reason ===")
+    tool = BashTool({"timeout": 10})
+    
+    # Test suspicious pattern detection
+    result = await tool.execute({"command": "git commit -m 'use brew services instead of sudo tailscaled'"})
+    print(f"Result: {result}")
+    
+    assert not result.success, "Command with 'sudo' in text should be rejected"
+    error_msg = result.error.get("message", "")
+    assert "sudo" in error_msg.lower(), f"Error should mention 'sudo' pattern, got: {error_msg}"
+    assert "suspicious pattern" in error_msg.lower(), f"Error should mention 'suspicious pattern', got: {error_msg}"
+    print(f"✓ Safety error includes reason: {error_msg}")
+    
+    # Test denied command detection
+    result2 = await tool.execute({"command": "rm -rf / --no-preserve-root"})
+    print(f"Result2: {result2}")
+    
+    assert not result2.success, "rm -rf should be rejected"
+    error_msg2 = result2.error.get("message", "")
+    assert "rm -rf" in error_msg2.lower(), f"Error should mention 'rm -rf' pattern, got: {error_msg2}"
+    print(f"✓ Denied command error includes reason: {error_msg2}")
+
+
 async def test_input_schema():
     """Test that input schema includes run_in_background."""
     print("\n=== Test 2: Input schema includes run_in_background ===")
@@ -287,6 +312,7 @@ async def main():
     
     tests = [
         test_basic_command,
+        test_safety_error_includes_reason,
         test_input_schema,
         test_run_in_background,
         test_timeout_behavior,

@@ -146,8 +146,12 @@ SAFETY:
         run_in_background = input.get("run_in_background", False)
 
         # Safety checks
-        if not self._is_safe_command(command):
-            return ToolResult(success=False, error={"message": f"Command denied for safety: {command}"})
+        is_safe, safety_reason = self._is_safe_command(command)
+        if not is_safe:
+            return ToolResult(
+                success=False,
+                error={"message": f"Command denied for safety: {safety_reason}"},
+            )
 
         # Approval is now handled by approval hook via tool:pre event
 
@@ -196,15 +200,20 @@ SAFETY:
             logger.error(f"Command execution error: {e}")
             return ToolResult(success=False, error={"message": str(e)})
 
-    def _is_safe_command(self, command: str) -> bool:
-        """Check if command is safe to execute."""
+    def _is_safe_command(self, command: str) -> tuple[bool, str | None]:
+        """Check if command is safe to execute.
+
+        Returns:
+            Tuple of (is_safe, reason). If is_safe is False, reason explains why.
+        """
         command_lower = command.lower()
 
         # Check against denied commands
         for denied in self.denied_commands:
             if denied.lower() in command_lower:
+                reason = f"Matches denied command pattern: {denied}"
                 logger.warning(f"Denied dangerous command: {command}")
-                return False
+                return False, reason
 
         # Check for suspicious patterns
         dangerous_patterns = [
@@ -222,10 +231,11 @@ SAFETY:
 
         for pattern in dangerous_patterns:
             if pattern in command_lower:
-                logger.warning(f"Suspicious pattern detected: {pattern}")
-                return False
+                reason = f"Suspicious pattern detected: {pattern}"
+                logger.warning(reason)
+                return False, reason
 
-        return True
+        return True, None
 
     def _is_pre_approved(self, command: str) -> bool:
         """Check if command is pre-approved."""
