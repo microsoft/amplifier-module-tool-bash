@@ -409,12 +409,15 @@ SAFETY:
             bash_exe = shutil.which("bash")
             if bash_exe:
                 # Use bash with nohup-style detachment
-                process = await asyncio.create_subprocess_shell(
+                # Use create_subprocess_exec to bypass cmd.exe shell entirely
+                # This avoids issues with spaces in bash path and shell escaping
+                process = await asyncio.create_subprocess_exec(
+                    bash_exe,
+                    "-c",
                     command,
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                     stdin=asyncio.subprocess.DEVNULL,
-                    executable=bash_exe,
                     cwd=self.working_dir,
                     creationflags=0x00000008,  # DETACHED_PROCESS on Windows
                 )
@@ -466,11 +469,14 @@ SAFETY:
 
             if bash_exe:
                 # Bash found on Windows - use it with full shell features
-                process = await asyncio.create_subprocess_shell(
+                # Use create_subprocess_exec to bypass cmd.exe shell entirely
+                # This avoids issues with spaces in bash path and shell escaping
+                process = await asyncio.create_subprocess_exec(
+                    bash_exe,
+                    "-c",
                     command,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    executable=bash_exe,
                     cwd=self.working_dir,
                 )
             else:
