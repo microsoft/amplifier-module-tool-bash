@@ -9,12 +9,10 @@ import asyncio
 import os
 import shutil
 import sys
-import tempfile
 
 import pytest
 
 from amplifier_module_tool_bash import BashTool
-
 
 # Check if bash is available
 BASH_AVAILABLE = shutil.which("bash") is not None
@@ -27,16 +25,9 @@ class TestWindowsBashSubprocessExec:
     """Test Windows bash subprocess execution with real bash."""
 
     @pytest.fixture
-    def tool(self):
+    def tool(self, tmp_path):
         """Create a BashTool instance with temp directory."""
-        tmpdir = tempfile.mkdtemp()
-        tool = BashTool({"working_dir": tmpdir})
-        yield tool
-        # Cleanup
-        try:
-            os.rmdir(tmpdir)
-        except:
-            pass
+        return BashTool({"working_dir": str(tmp_path)})
 
     @pytest.mark.asyncio
     async def test_simple_echo_command(self, tool):
@@ -89,7 +80,7 @@ class TestWindowsBashSubprocessExec:
     async def test_background_execution_starts(self, tool):
         """Test background command execution returns PID."""
         # Use a command that will run briefly
-        result = await tool._run_command_background("sleep 0.1")
+        result = await tool._run_command_background("pwd")
         
         assert "pid" in result
         assert isinstance(result["pid"], int)
