@@ -25,9 +25,9 @@ class TestWindowsBashSubprocessExec:
     """Test Windows bash subprocess execution with real bash."""
 
     @pytest.fixture
-    def tool(self, tmp_path):
+    def tool(self):
         """Create a BashTool instance with temp directory."""
-        return BashTool({"working_dir": str(tmp_path)})
+        return BashTool()
 
     @pytest.mark.asyncio
     async def test_simple_echo_command(self, tool):
