@@ -15,8 +15,7 @@ import signal
 import sys
 from typing import Any
 
-from amplifier_core import ModuleCoordinator
-from amplifier_core import ToolResult
+from amplifier_core import ModuleCoordinator, ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +100,8 @@ SAFETY:
         self.working_dir = config.get("working_dir", ".")
         # Output limiting to prevent context overflow
         self.max_output_bytes = config.get("max_output_bytes", self.DEFAULT_MAX_OUTPUT_BYTES)
+        # Cache for bash detection to avoid repeated checks for same exe path
+        self._bash_type_cache = {}
 
     @property
     def input_schema(self) -> dict:
@@ -262,6 +263,37 @@ SAFETY:
 
         return False
 
+    async def _is_wsl_bash(self, bash_exe: str) -> bool:
+        """Detect if bash executable is WSL bash (not Git Bash).
+        
+        Returns:
+            True if WSL bash, False otherwise
+        """
+        # Check cache first
+        if bash_exe in self._bash_type_cache:
+            return self._bash_type_cache[bash_exe]
+        
+        try:
+            # Check if /mnt/wsl directory exists (WSL-specific mount point)
+            proc = await asyncio.create_subprocess_exec(
+                bash_exe,
+                "-c",
+                "test -d /mnt/wsl",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=".",
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=2)
+            
+            is_wsl = proc.returncode == 0  # Exit code 0 means directory exists (WSL)
+            self._bash_type_cache[bash_exe] = is_wsl
+            return is_wsl
+        except Exception:
+            pass
+        
+        is_wsl = self._bash_type_cache[bash_exe] = False
+        return is_wsl
+
     def _extract_head_bytes(self, output: str, budget: int) -> str:
         """Extract first N bytes from output, respecting UTF-8 boundaries.
 
@@ -408,11 +440,9 @@ SAFETY:
             # Windows background execution
             bash_exe = shutil.which("bash")
             if bash_exe:
-                # Use bash with nohup-style detachment
-                # Use create_subprocess_exec to bypass cmd.exe shell entirely
-                # This avoids issues with spaces in bash path and shell escaping
+                exec_args = ("wsl", "--exec", "bash") if await self._is_wsl_bash(bash_exe) else (bash_exe,)
                 process = await asyncio.create_subprocess_exec(
-                    bash_exe,
+                    *exec_args,
                     "-c",
                     command,
                     stdout=asyncio.subprocess.DEVNULL,
@@ -468,11 +498,9 @@ SAFETY:
             bash_exe = shutil.which("bash")
 
             if bash_exe:
-                # Bash found on Windows - use it with full shell features
-                # Use create_subprocess_exec to bypass cmd.exe shell entirely
-                # This avoids issues with spaces in bash path and shell escaping
+                exec_args = ("wsl", "--exec", "bash") if await self._is_wsl_bash(bash_exe) else (bash_exe,)
                 process = await asyncio.create_subprocess_exec(
-                    bash_exe,
+                    *exec_args,
                     "-c",
                     command,
                     stdout=asyncio.subprocess.PIPE,
