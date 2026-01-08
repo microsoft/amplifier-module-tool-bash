@@ -40,7 +40,12 @@ class TestWindowsBashSubprocessExec:
 
     @pytest.mark.asyncio
     async def test_bash_path_detection(self, tool):
-        """Test that bash is properly detected on Windows."""
+        """Test that bash is properly detected on Windows.
+        
+        Critical for WSL: Validates that $BASH_VERSION is evaluated inside bash,
+        not prematurely expanded by the WSL launcher. Our WSL detection logic
+        ensures 'wsl --exec bash' is used when needed.
+        """
         # Verify bash path is set
         assert BASH_PATH is not None
         assert os.path.exists(BASH_PATH)
@@ -48,7 +53,7 @@ class TestWindowsBashSubprocessExec:
         # Run command to verify it uses the detected bash
         result = await tool._run_command("echo $BASH_VERSION")
         assert result["returncode"] == 0
-        # Should have bash version in output (e.g., "5.2.15(1)-release")
+        # Must not be empty - empty means variable was expanded prematurely (outside of bash)
         assert len(result["stdout"].strip()) > 0
 
     @pytest.mark.asyncio
