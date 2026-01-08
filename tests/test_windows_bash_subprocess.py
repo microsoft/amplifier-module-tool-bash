@@ -17,9 +17,10 @@ from amplifier_module_tool_bash import BashTool
 # Check if bash is available
 BASH_AVAILABLE = shutil.which("bash") is not None
 BASH_PATH = shutil.which("bash") if BASH_AVAILABLE else None
+WINDOWS_AND_BASH = sys.platform == "win32" and BASH_AVAILABLE
 
 
-@pytest.mark.skipif(not BASH_AVAILABLE or sys.platform != "win32", 
+@pytest.mark.skipif(not WINDOWS_AND_BASH, 
                    reason="Requires bash on Windows (Git Bash or WSL)")
 class TestWindowsBashSubprocessExec:
     """Test Windows bash subprocess execution with real bash."""
