@@ -27,7 +27,7 @@ class TestWindowsBashSubprocessExec:
     @pytest.fixture
     def tool(self):
         """Create a BashTool instance with temp directory."""
-        return BashTool()
+        return BashTool({})
 
     @pytest.mark.asyncio
     async def test_simple_echo_command(self, tool):
