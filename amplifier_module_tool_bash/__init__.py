@@ -12,6 +12,7 @@ import os
 import shlex
 import shutil
 import signal
+import subprocess
 import sys
 from typing import Any
 
@@ -401,22 +402,31 @@ SAFETY:
         - New session (setsid) so it's not killed when parent exits
         - Pipes redirected to /dev/null to prevent blocking
         - Returns immediately with PID for management
+
+        Uses subprocess.Popen instead of asyncio.create_subprocess_* to avoid
+        creating asyncio transports that would need cleanup. Since we're fully
+        detaching the process anyway, we don't need asyncio's process management.
+        This prevents "Event loop is closed" errors during session cleanup.
         """
         is_windows = sys.platform == "win32"
+
+        # Open /dev/null for redirecting stdin/stdout/stderr
+        devnull = subprocess.DEVNULL
 
         if is_windows:
             # Windows background execution
             bash_exe = shutil.which("bash")
             if bash_exe:
                 # Use bash with nohup-style detachment
-                process = await asyncio.create_subprocess_shell(
+                process = subprocess.Popen(
                     command,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                    stdin=asyncio.subprocess.DEVNULL,
+                    shell=True,
+                    stdout=devnull,
+                    stderr=devnull,
+                    stdin=devnull,
                     executable=bash_exe,
                     cwd=self.working_dir,
-                    creationflags=0x00000008,  # DETACHED_PROCESS on Windows
+                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
                 )
             else:
                 try:
@@ -424,21 +434,22 @@ SAFETY:
                 except ValueError as e:
                     raise ValueError(f"Invalid command syntax: {e}")
 
-                process = await asyncio.create_subprocess_exec(
-                    *args,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL,
-                    stdin=asyncio.subprocess.DEVNULL,
+                process = subprocess.Popen(
+                    args,
+                    stdout=devnull,
+                    stderr=devnull,
+                    stdin=devnull,
                     cwd=self.working_dir,
-                    creationflags=0x00000008,  # DETACHED_PROCESS
+                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
                 )
         else:
-            # Unix-like: Use setsid to create new session, fully detached
-            process = await asyncio.create_subprocess_shell(
+            # Unix-like: Use start_new_session to create new session, fully detached
+            process = subprocess.Popen(
                 command,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                stdin=asyncio.subprocess.DEVNULL,
+                shell=True,
+                stdout=devnull,
+                stderr=devnull,
+                stdin=devnull,
                 executable="/bin/bash",
                 cwd=self.working_dir,
                 start_new_session=True,  # Creates new session, detaches from terminal
