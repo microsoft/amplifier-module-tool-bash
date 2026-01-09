@@ -36,6 +36,14 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     tool = BashTool(config)
     await coordinator.mount("tools", tool, name=tool.name)
     logger.info("Mounted BashTool")
+
+    # Register cleanup function to properly close subprocess transports
+    # before the event loop closes (prevents "Event loop is closed" errors
+    # during garbage collection of subprocess transport objects)
+    async def cleanup_subprocesses():
+        await tool.cleanup()
+
+    coordinator.register_cleanup(cleanup_subprocesses)
     return
 
 
@@ -101,6 +109,8 @@ SAFETY:
         self.working_dir = config.get("working_dir", ".")
         # Output limiting to prevent context overflow
         self.max_output_bytes = config.get("max_output_bytes", self.DEFAULT_MAX_OUTPUT_BYTES)
+        # Track background processes for cleanup (prevents "Event loop is closed" errors)
+        self._background_processes: list[asyncio.subprocess.Process] = []
 
     @property
     def input_schema(self) -> dict:
@@ -128,6 +138,34 @@ SAFETY:
                 "safe_patterns": self.allowed_commands,
             },
         }
+
+    async def cleanup(self) -> None:
+        """Clean up subprocess transports before event loop closes.
+
+        This prevents "RuntimeError: Event loop is closed" errors that occur
+        when asyncio subprocess transports are garbage collected after the
+        event loop has already closed. By explicitly closing the transports
+        while the loop is still running, we ensure clean shutdown.
+
+        Note: Background processes continue running (they're detached at OS level).
+        This cleanup only affects the Python asyncio transport objects.
+        """
+        if not self._background_processes:
+            return
+
+        logger.debug(f"Cleaning up {len(self._background_processes)} background process transport(s)")
+
+        for process in self._background_processes:
+            try:
+                # Close the transport to prevent GC issues after loop closes
+                # The process itself continues running (it's detached)
+                if process._transport is not None:
+                    process._transport.close()
+            except Exception as e:
+                # Best effort cleanup - don't fail if process already cleaned up
+                logger.debug(f"Transport cleanup note: {e}")
+
+        self._background_processes.clear()
 
     async def execute(self, input: dict[str, Any]) -> ToolResult:
         """
@@ -443,6 +481,10 @@ SAFETY:
                 cwd=self.working_dir,
                 start_new_session=True,  # Creates new session, detaches from terminal
             )
+
+        # Track process for cleanup to prevent "Event loop is closed" errors
+        # when the transport is garbage collected after the loop closes
+        self._background_processes.append(process)
 
         return {"pid": process.pid}
 
