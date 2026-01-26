@@ -29,6 +29,12 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     Args:
         coordinator: Module coordinator
         config: Tool configuration
+            - working_dir: Working directory for command execution (default: ".")
+              If not set, falls back to session.working_dir capability.
+            - timeout: Command timeout in seconds (default: 30)
+            - require_approval: Require approval for commands (default: True)
+            - allowed_commands: Whitelist of allowed commands (default: [])
+            - denied_commands: Blocklist of dangerous commands (default: common dangerous patterns)
 
     Returns:
         Optional cleanup function

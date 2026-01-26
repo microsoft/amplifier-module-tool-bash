@@ -72,11 +72,14 @@ Execute a bash command with platform-appropriate shell.
 [[tools]]
 module = "tool-bash"
 config = {
-    timeout = 30,  # Default timeout in seconds
+    working_dir = ".",  # Working directory (defaults to session.working_dir capability)
+    timeout = 30,       # Default timeout in seconds
     require_approval = false,
     allowed_commands = []  # Empty = all allowed
 }
 ```
+
+> **Note**: If `working_dir` is not set in config, the module uses the `session.working_dir` coordinator capability if available, falling back to `Path.cwd()`. This enables correct behavior in server/web deployments where the process cwd differs from the user's project directory.
 
 ## Security
 
