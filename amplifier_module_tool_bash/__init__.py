@@ -29,11 +29,25 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     Args:
         coordinator: Module coordinator
         config: Tool configuration
+            - working_dir: Working directory for command execution (default: ".")
+              If not set, falls back to session.working_dir capability.
+            - timeout: Command timeout in seconds (default: 30)
+            - require_approval: Require approval for commands (default: True)
+            - allowed_commands: Whitelist of allowed commands (default: [])
+            - denied_commands: Blocklist of dangerous commands (default: common dangerous patterns)
 
     Returns:
         Optional cleanup function
     """
     config = config or {}
+
+    # If working_dir not explicitly set in config, use session.working_dir capability
+    # This enables server deployments where Path.cwd() returns the wrong directory
+    if "working_dir" not in config:
+        working_dir = coordinator.get_capability("session.working_dir")
+        if working_dir:
+            config = {**config, "working_dir": working_dir}
+
     tool = BashTool(config)
     await coordinator.mount("tools", tool, name=tool.name)
     logger.info("Mounted BashTool")
@@ -96,12 +110,15 @@ SAFETY:
         self.require_approval = config.get("require_approval", True)
         self.allowed_commands = config.get("allowed_commands", [])
         self.denied_commands = config.get(
-            "denied_commands", ["rm -rf /", "sudo rm", "dd if=/dev/zero", "fork bomb", ":(){ :|:& };:"]
+            "denied_commands",
+            ["rm -rf /", "sudo rm", "dd if=/dev/zero", "fork bomb", ":(){ :|:& };:"],
         )
         self.timeout = config.get("timeout", 30)
         self.working_dir = config.get("working_dir", ".")
         # Output limiting to prevent context overflow
-        self.max_output_bytes = config.get("max_output_bytes", self.DEFAULT_MAX_OUTPUT_BYTES)
+        self.max_output_bytes = config.get(
+            "max_output_bytes", self.DEFAULT_MAX_OUTPUT_BYTES
+        )
 
     @property
     def input_schema(self) -> dict:
@@ -173,8 +190,12 @@ SAFETY:
                 result = await self._run_command(command)
 
                 # Apply output truncation to prevent context overflow
-                stdout, stdout_truncated, stdout_bytes = self._truncate_output(result["stdout"])
-                stderr, stderr_truncated, stderr_bytes = self._truncate_output(result["stderr"])
+                stdout, stdout_truncated, stdout_bytes = self._truncate_output(
+                    result["stdout"]
+                )
+                stderr, stderr_truncated, stderr_bytes = self._truncate_output(
+                    result["stderr"]
+                )
 
                 output = {
                     "stdout": stdout,
@@ -196,7 +217,10 @@ SAFETY:
                 )
 
         except TimeoutError:
-            return ToolResult(success=False, error={"message": f"Command timed out after {self.timeout} seconds"})
+            return ToolResult(
+                success=False,
+                error={"message": f"Command timed out after {self.timeout} seconds"},
+            )
         except Exception as e:
             logger.error(f"Command execution error: {e}")
             return ToolResult(success=False, error={"message": str(e)})
@@ -365,7 +389,9 @@ SAFETY:
         tail_content = "\n".join(tail_lines)
 
         # Check if line-based truncation captured enough content
-        captured_bytes = len(head_content.encode("utf-8")) + len(tail_content.encode("utf-8"))
+        captured_bytes = len(head_content.encode("utf-8")) + len(
+            tail_content.encode("utf-8")
+        )
         min_useful = self.max_output_bytes * 0.2  # At least 20% of limit
 
         if captured_bytes < min_useful:
@@ -426,7 +452,8 @@ SAFETY:
                     stdin=devnull,
                     executable=bash_exe,
                     cwd=self.working_dir,
-                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                    creationflags=subprocess.DETACHED_PROCESS
+                    | subprocess.CREATE_NEW_PROCESS_GROUP,
                 )
             else:
                 try:
@@ -440,7 +467,8 @@ SAFETY:
                     stderr=devnull,
                     stdin=devnull,
                     cwd=self.working_dir,
-                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                    creationflags=subprocess.DETACHED_PROCESS
+                    | subprocess.CREATE_NEW_PROCESS_GROUP,
                 )
         else:
             # Unix-like: Use start_new_session to create new session, fully detached
@@ -512,7 +540,10 @@ SAFETY:
                     raise ValueError(f"Invalid command syntax: {e}")
 
                 process = await asyncio.create_subprocess_exec(
-                    *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, cwd=self.working_dir
+                    *args,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=self.working_dir,
                 )
         else:
             # Unix-like (Linux, macOS, WSL): Use real bash shell
@@ -540,7 +571,9 @@ SAFETY:
 
         # Wait for completion with timeout
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=self.timeout)
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=self.timeout
+            )
 
             return {
                 "stdout": stdout.decode("utf-8", errors="replace"),
