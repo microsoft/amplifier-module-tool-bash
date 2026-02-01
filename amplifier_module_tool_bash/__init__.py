@@ -19,6 +19,8 @@ from typing import Any
 from amplifier_core import ModuleCoordinator
 from amplifier_core import ToolResult
 
+from .safety import SafetyConfig, SafetyValidator
+
 logger = logging.getLogger(__name__)
 
 
@@ -33,8 +35,11 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
               If not set, falls back to session.working_dir capability.
             - timeout: Command timeout in seconds (default: 30)
             - require_approval: Require approval for commands (default: True)
+            - safety_profile: Safety profile to use (default: "strict")
+              Options: "strict", "standard", "permissive", "unrestricted"
             - allowed_commands: Whitelist of allowed commands (default: [])
-            - denied_commands: Blocklist of dangerous commands (default: common dangerous patterns)
+            - denied_commands: Additional custom blocklist patterns (default: [])
+            - safety_overrides: Fine-grained safety overrides dict with 'allow' and 'block' lists
 
     Returns:
         Optional cleanup function
@@ -108,17 +113,28 @@ SAFETY:
         """
         self.config = config
         self.require_approval = config.get("require_approval", True)
-        self.allowed_commands = config.get("allowed_commands", [])
-        self.denied_commands = config.get(
-            "denied_commands",
-            ["rm -rf /", "sudo rm", "dd if=/dev/zero", "fork bomb", ":(){ :|:& };:"],
-        )
         self.timeout = config.get("timeout", 30)
         self.working_dir = config.get("working_dir", ".")
         # Output limiting to prevent context overflow
         self.max_output_bytes = config.get(
             "max_output_bytes", self.DEFAULT_MAX_OUTPUT_BYTES
         )
+
+        # Initialize safety validator with profile-based system
+        safety_profile = config.get("safety_profile", "strict")
+        safety_config = SafetyConfig(
+            profile=safety_profile,
+            allowed_commands=config.get("allowed_commands", []),
+            denied_commands=config.get("denied_commands", []),
+            safety_overrides=config.get("safety_overrides"),
+        )
+        self._safety_validator = SafetyValidator(
+            profile=safety_profile, config=safety_config
+        )
+
+        # Keep for backward compatibility with get_metadata
+        self.allowed_commands = config.get("allowed_commands", [])
+        self.denied_commands = config.get("denied_commands", [])
 
     @property
     def input_schema(self) -> dict:
@@ -163,12 +179,15 @@ SAFETY:
 
         run_in_background = input.get("run_in_background", False)
 
-        # Safety checks
-        is_safe, safety_reason = self._is_safe_command(command)
-        if not is_safe:
+        # Safety checks using profile-based validator
+        safety_result = self._safety_validator.validate(command)
+        if not safety_result.allowed:
+            error_msg = f"Command denied for safety: {safety_result.reason}"
+            if safety_result.hint:
+                error_msg += f"\n  Hint: {safety_result.hint}"
             return ToolResult(
                 success=False,
-                error={"message": f"Command denied for safety: {safety_reason}"},
+                error={"message": error_msg},
             )
 
         # Approval is now handled by approval hook via tool:pre event
@@ -225,67 +244,9 @@ SAFETY:
             logger.error(f"Command execution error: {e}")
             return ToolResult(success=False, error={"message": str(e)})
 
-    def _is_safe_command(self, command: str) -> tuple[bool, str | None]:
-        """Check if command is safe to execute.
-
-        Returns:
-            Tuple of (is_safe, reason). If is_safe is False, reason explains why.
-        """
-        command_lower = command.lower()
-
-        # Check against denied commands
-        for denied in self.denied_commands:
-            if denied.lower() in command_lower:
-                reason = f"Matches denied command pattern: {denied}"
-                logger.warning(f"Denied dangerous command: {command}")
-                return False, reason
-
-        # Check for suspicious patterns
-        dangerous_patterns = [
-            "rm -rf",
-            "rm -fr",
-            "dd if=",
-            "mkfs",
-            "> /dev/",
-            "sudo",
-            "su -",
-            "passwd",
-            "chmod 777 /",
-            "chown -R",
-        ]
-
-        for pattern in dangerous_patterns:
-            if pattern in command_lower:
-                reason = f"Suspicious pattern detected: {pattern}"
-                logger.warning(reason)
-                return False, reason
-
-        return True, None
-
-    def _is_pre_approved(self, command: str) -> bool:
-        """Check if command is pre-approved."""
-        if not self.allowed_commands:
-            return False
-
-        # Check exact matches
-        if command in self.allowed_commands:
-            return True
-
-        # Check pattern matches
-        for allowed in self.allowed_commands:
-            if allowed.endswith("*"):
-                # Prefix match
-                if command.startswith(allowed[:-1]):
-                    return True
-            elif "*" in allowed:
-                # Pattern match (simple)
-                pattern = allowed.replace("*", ".*")
-                import re
-
-                if re.match(pattern, command):
-                    return True
-
-        return False
+    # NOTE: _is_safe_command and _is_pre_approved have been replaced by
+    # SafetyValidator which provides profile-based safety with smart pattern matching.
+    # See safety.py for the implementation.
 
     def _extract_head_bytes(self, output: str, budget: int) -> str:
         """Extract first N bytes from output, respecting UTF-8 boundaries.
