@@ -72,22 +72,78 @@ Execute a bash command with platform-appropriate shell.
 [[tools]]
 module = "tool-bash"
 config = {
-    working_dir = ".",  # Working directory (defaults to session.working_dir capability)
-    timeout = 30,       # Default timeout in seconds
+    working_dir = ".",           # Working directory (defaults to session.working_dir capability)
+    timeout = 30,                # Default timeout in seconds
     require_approval = false,
-    allowed_commands = []  # Empty = all allowed
+    safety_profile = "strict",   # Safety profile: strict, standard, permissive, unrestricted
+    allowed_commands = [],       # Allowlist patterns (supports wildcards)
+    denied_commands = [],        # Additional custom blocked patterns
+    safety_overrides = {         # Fine-grained overrides
+        allow = [],              # Patterns to allow (even if normally blocked)
+        block = []               # Patterns to block (even if normally allowed)
+    }
 }
 ```
 
 > **Note**: If `working_dir` is not set in config, the module uses the `session.working_dir` coordinator capability if available, falling back to `Path.cwd()`. This enables correct behavior in server/web deployments where the process cwd differs from the user's project directory.
 
+## Safety Profiles
+
+The bash tool uses a profile-based safety system with smart pattern matching.
+
+### Available Profiles
+
+| Profile | `sudo` | `rm -rf /` | Use Case |
+|---------|--------|------------|----------|
+| **`strict`** (default) | ❌ Blocked | ❌ Blocked | Workstations, shared environments |
+| **`standard`** | ❌ (allowlist can override) | ❌ Blocked | Trusted environments with specific needs |
+| **`permissive`** | ✅ Allowed | ❌ Blocked | Containers, VMs, dedicated instances |
+| **`unrestricted`** | ✅ Allowed | ✅ Allowed | Dedicated hardware (e.g., Raspberry Pi) |
+
+### Smart Pattern Matching
+
+The safety system distinguishes between actual commands and text in strings/paths:
+
+```bash
+# ✅ ALLOWED - "sudo" is in a quoted string, not a command
+echo "use sudo for admin tasks"
+
+# ✅ ALLOWED - path contains /dev/ but isn't a device redirect  
+cd ~/dev/my-project
+
+# ❌ BLOCKED - actual sudo command
+sudo apt install vim
+
+# ❌ BLOCKED - actual device redirect
+cat file > /dev/sda
+```
+
+### Overriding Safety Rules
+
+For containers, VMs, or dedicated hardware where you want elevated access:
+
+```toml
+# Allow sudo for container/VM environments
+config = { safety_profile = "permissive" }
+
+# Allow specific sudo commands only
+config = {
+    safety_profile = "standard",
+    allowed_commands = ["sudo systemctl *", "sudo apt *"]
+}
+
+# Full access for dedicated hardware
+config = { safety_profile = "unrestricted" }
+```
+
 ## Security
 
 **IMPORTANT**: Bash execution can be dangerous. Use with caution:
 
+- Use `strict` profile (default) for shared/workstation environments
 - Set `require_approval = true` for production
 - Use `allowed_commands` to whitelist safe commands
-- Run in isolated/containerized environments
+- Use `permissive` or `unrestricted` only in isolated environments
 - Never execute untrusted user input
 
 ## Usage Example
