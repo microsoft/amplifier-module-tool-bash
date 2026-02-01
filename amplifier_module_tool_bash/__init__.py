@@ -9,6 +9,7 @@ __amplifier_module_type__ = "tool"
 import asyncio
 import logging
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -246,7 +247,6 @@ SAFETY:
             "rm -fr",
             "dd if=",
             "mkfs",
-            "> /dev/",
             "sudo",
             "su -",
             "passwd",
@@ -259,6 +259,13 @@ SAFETY:
                 reason = f"Suspicious pattern detected: {pattern}"
                 logger.warning(reason)
                 return False, reason
+        # Check for writes to actual device files (not user directories like ~/dev/)
+        # Pattern matches redirects to /dev/sd*, /dev/hd*, /dev/nvme*, etc. at path boundaries
+        device_redirect_pattern = re.compile(r'>\s*/dev/(sd|hd|nvme|loop|dm|mapper)', re.IGNORECASE)
+        if device_redirect_pattern.search(command):
+            reason = "Suspicious pattern detected: redirect to block device"
+            logger.warning(reason)
+            return False, reason
 
         return True, None
 
