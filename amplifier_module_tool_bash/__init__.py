@@ -136,6 +136,9 @@ SAFETY:
         self.allowed_commands = config.get("allowed_commands", [])
         self.denied_commands = config.get("denied_commands", [])
 
+        # Cache for WSL bash detection to avoid repeated checks
+        self._wsl_bash_cache: dict[str, bool] = {}
+
     @property
     def input_schema(self) -> dict:
         """Return JSON schema for tool parameters."""
@@ -382,6 +385,44 @@ SAFETY:
         truncated = head_content + truncation_indicator + tail_content
         return truncated, True, original_bytes
 
+    async def _is_wsl_bash(self, bash_exe: str) -> bool:
+        """Detect if bash executable is WSL bash (not Git Bash).
+
+        WSL bash requires special invocation via 'wsl --exec bash' to prevent
+        the WSL launcher from prematurely expanding shell variables before
+        they reach the bash interpreter.
+
+        Args:
+            bash_exe: Path to bash executable
+
+        Returns:
+            True if WSL bash, False if Git Bash or other
+        """
+        # Check cache first
+        if bash_exe in self._wsl_bash_cache:
+            return self._wsl_bash_cache[bash_exe]
+
+        try:
+            # Check if /mnt/wsl directory exists (WSL-specific mount point)
+            proc = await asyncio.create_subprocess_exec(
+                bash_exe,
+                "-c",
+                "test -d /mnt/wsl",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=".",
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=2)
+
+            # Exit code 0 means directory exists (WSL)
+            is_wsl = proc.returncode == 0
+            self._wsl_bash_cache[bash_exe] = is_wsl
+            return is_wsl
+        except Exception:
+            # On any error, assume not WSL
+            self._wsl_bash_cache[bash_exe] = False
+            return False
+
     async def _run_command_background(self, command: str) -> dict[str, Any]:
         """Run command in background, returning immediately with PID.
 
@@ -404,18 +445,33 @@ SAFETY:
             # Windows background execution
             bash_exe = shutil.which("bash")
             if bash_exe:
-                # Use bash with nohup-style detachment
-                process = subprocess.Popen(
-                    command,
-                    shell=True,
-                    stdout=devnull,
-                    stderr=devnull,
-                    stdin=devnull,
-                    executable=bash_exe,
-                    cwd=self.working_dir,
-                    creationflags=subprocess.DETACHED_PROCESS
-                    | subprocess.CREATE_NEW_PROCESS_GROUP,
-                )
+                # Determine if WSL bash (requires special invocation)
+                # Note: We need to run detection synchronously here since Popen is sync
+                # Use cached result if available, otherwise assume not WSL for background
+                is_wsl = self._wsl_bash_cache.get(bash_exe, False)
+
+                if is_wsl:
+                    # WSL bash: Use 'wsl --exec bash -c' to prevent premature variable expansion
+                    process = subprocess.Popen(
+                        ["wsl", "--exec", "bash", "-c", command],
+                        stdout=devnull,
+                        stderr=devnull,
+                        stdin=devnull,
+                        cwd=self.working_dir,
+                        creationflags=subprocess.DETACHED_PROCESS
+                        | subprocess.CREATE_NEW_PROCESS_GROUP,
+                    )
+                else:
+                    # Git Bash or other: Use subprocess_exec pattern (handles paths with spaces)
+                    process = subprocess.Popen(
+                        [bash_exe, "-c", command],
+                        stdout=devnull,
+                        stderr=devnull,
+                        stdin=devnull,
+                        cwd=self.working_dir,
+                        creationflags=subprocess.DETACHED_PROCESS
+                        | subprocess.CREATE_NEW_PROCESS_GROUP,
+                    )
             else:
                 try:
                     args = shlex.split(command)
@@ -465,14 +521,34 @@ SAFETY:
             bash_exe = shutil.which("bash")
 
             if bash_exe:
-                # Bash found on Windows - use it with full shell features
-                process = await asyncio.create_subprocess_shell(
-                    command,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    executable=bash_exe,
-                    cwd=self.working_dir,
-                )
+                # Bash found on Windows - use create_subprocess_exec to handle
+                # paths with spaces (e.g., "C:\Program Files\Git\bin\bash.exe")
+                # and properly handle WSL bash variable expansion
+                is_wsl = await self._is_wsl_bash(bash_exe)
+
+                if is_wsl:
+                    # WSL bash: Use 'wsl --exec bash -c' to prevent premature
+                    # variable expansion by the WSL launcher
+                    process = await asyncio.create_subprocess_exec(
+                        "wsl",
+                        "--exec",
+                        "bash",
+                        "-c",
+                        command,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=self.working_dir,
+                    )
+                else:
+                    # Git Bash or other: Direct exec with [bash, -c, command]
+                    process = await asyncio.create_subprocess_exec(
+                        bash_exe,
+                        "-c",
+                        command,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=self.working_dir,
+                    )
             else:
                 # No bash found - fall back to limited cmd.exe behavior
                 # Check for shell features that won't work in cmd.exe
