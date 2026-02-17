@@ -178,7 +178,8 @@ SAFETY:
         """
         command = input.get("command")
         if not command:
-            return ToolResult(success=False, error={"message": "Command is required"})
+            error_msg = "Command is required"
+            return ToolResult(success=False, output=error_msg, error={"message": error_msg})
 
         run_in_background = input.get("run_in_background", False)
 
@@ -190,6 +191,7 @@ SAFETY:
                 error_msg += f"\n  Hint: {safety_result.hint}"
             return ToolResult(
                 success=False,
+                output=error_msg,
                 error={"message": error_msg},
             )
 
@@ -239,13 +241,16 @@ SAFETY:
                 )
 
         except TimeoutError:
+            error_msg = f"Command timed out after {self.timeout} seconds"
             return ToolResult(
                 success=False,
-                error={"message": f"Command timed out after {self.timeout} seconds"},
+                output=error_msg,
+                error={"message": error_msg},
             )
         except Exception as e:
             logger.error(f"Command execution error: {e}")
-            return ToolResult(success=False, error={"message": str(e)})
+            error_msg = str(e)
+            return ToolResult(success=False, output=error_msg, error={"message": error_msg})
 
     # NOTE: _is_safe_command and _is_pre_approved have been replaced by
     # SafetyValidator which provides profile-based safety with smart pattern matching.
