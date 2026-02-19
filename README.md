@@ -40,7 +40,8 @@ Execute a bash command with platform-appropriate shell.
 **Input:**
 
 - `command` (string): The bash command to execute
-- `timeout` (int, optional): Timeout in seconds (default: 30)
+- `timeout` (int, optional): Timeout in seconds (default: 30). Increase for builds, tests, or monitoring. Use `run_in_background` for truly indefinite processes.
+- `run_in_background` (bool, optional): Run command in background, returning immediately with PID (default: false)
 
 **Output:**
 

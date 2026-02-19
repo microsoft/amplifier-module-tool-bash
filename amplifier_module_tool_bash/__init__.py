@@ -93,6 +93,8 @@ COMMAND GUIDELINES:
 - Quote paths containing spaces: cd "/path/with spaces"
 - Prefer absolute paths to maintain working directory context
 - Chain dependent commands with && (mkdir foo && cd foo)
+- Commands time out after 30 seconds by default. Pass `timeout` to increase for long-running
+  commands (builds, tests, monitoring). Use `run_in_background` for truly indefinite processes.
 - Use `run_in_background` for long-running processes (dev servers, watchers)
 - Interactive commands (-i flags, editors requiring input) are not supported
 
@@ -146,6 +148,10 @@ SAFETY:
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Bash command to execute"},
+                "timeout": {
+                    "type": "integer",
+                    "description": "Command timeout in seconds (default: 30). Increase for builds, tests, or monitoring. Use run_in_background for truly indefinite processes.",
+                },
                 "run_in_background": {
                     "type": "boolean",
                     "description": "Run command in background, returning immediately with PID. Use for long-running processes like dev servers.",
@@ -179,8 +185,11 @@ SAFETY:
         command = input.get("command")
         if not command:
             error_msg = "Command is required"
-            return ToolResult(success=False, output=error_msg, error={"message": error_msg})
+            return ToolResult(
+                success=False, output=error_msg, error={"message": error_msg}
+            )
 
+        timeout = input.get("timeout", self.timeout)
         run_in_background = input.get("run_in_background", False)
 
         # Safety checks using profile-based validator
@@ -211,7 +220,7 @@ SAFETY:
                 )
             else:
                 # Execute command and wait for completion
-                result = await self._run_command(command)
+                result = await self._run_command(command, timeout=timeout)
 
                 # Apply output truncation to prevent context overflow
                 stdout, stdout_truncated, stdout_bytes = self._truncate_output(
@@ -241,7 +250,7 @@ SAFETY:
                 )
 
         except TimeoutError:
-            error_msg = f"Command timed out after {self.timeout} seconds"
+            error_msg = f"Command timed out after {timeout} seconds"
             return ToolResult(
                 success=False,
                 output=error_msg,
@@ -250,7 +259,9 @@ SAFETY:
         except Exception as e:
             logger.error(f"Command execution error: {e}")
             error_msg = str(e)
-            return ToolResult(success=False, output=error_msg, error={"message": error_msg})
+            return ToolResult(
+                success=False, output=error_msg, error={"message": error_msg}
+            )
 
     # NOTE: _is_safe_command and _is_pre_approved have been replaced by
     # SafetyValidator which provides profile-based safety with smart pattern matching.
@@ -507,7 +518,9 @@ SAFETY:
 
         return {"pid": process.pid}
 
-    async def _run_command(self, command: str) -> dict[str, Any]:
+    async def _run_command(
+        self, command: str, timeout: int | None = None
+    ) -> dict[str, Any]:
         """Run command asynchronously with platform-appropriate shell.
 
         On Unix-like systems (Linux, macOS, WSL), uses bash for full shell features.
@@ -612,9 +625,10 @@ SAFETY:
             pgid = process.pid
 
         # Wait for completion with timeout
+        effective_timeout = timeout if timeout is not None else self.timeout
         try:
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=self.timeout
+                process.communicate(), timeout=effective_timeout
             )
 
             return {
