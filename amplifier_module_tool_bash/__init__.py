@@ -138,6 +138,10 @@ SAFETY:
         self.allowed_commands = config.get("allowed_commands", [])
         self.denied_commands = config.get("denied_commands", [])
 
+        # Concurrency limit: maximum number of commands that can run simultaneously
+        self.max_concurrent = config.get("max_concurrent", None)
+        self._active_commands = 0
+
         # Cache for WSL bash detection to avoid repeated checks
         self._wsl_bash_cache: dict[str, bool] = {}
 
@@ -206,6 +210,19 @@ SAFETY:
 
         # Approval is now handled by approval hook via tool:pre event
 
+        # Concurrency limit check
+        if (
+            self.max_concurrent is not None
+            and self._active_commands >= self.max_concurrent
+        ):
+            error_msg = f"Command rejected: concurrent command limit of {self.max_concurrent} reached"
+            return ToolResult(
+                success=False,
+                output=error_msg,
+                error={"message": error_msg},
+            )
+
+        self._active_commands += 1
         try:
             if run_in_background:
                 # Execute command in background and return immediately
@@ -262,6 +279,8 @@ SAFETY:
             return ToolResult(
                 success=False, output=error_msg, error={"message": error_msg}
             )
+        finally:
+            self._active_commands -= 1
 
     # NOTE: _is_safe_command and _is_pre_approved have been replaced by
     # SafetyValidator which provides profile-based safety with smart pattern matching.
