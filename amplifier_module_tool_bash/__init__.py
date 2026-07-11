@@ -24,6 +24,76 @@ from .safety import SafetyConfig, SafetyValidator
 logger = logging.getLogger(__name__)
 
 
+def _read_ppid(pid: int) -> int | None:
+    """Read a process's parent PID from /proc/<pid>/stat (Linux only).
+
+    Returns None if the process doesn't exist or can't be read.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            content = f.read()
+    except OSError:
+        return None
+
+    # Format: "<pid> (<comm>) <state> <ppid> ...". comm can contain spaces
+    # or parentheses, so find the LAST ')' to safely skip past it before
+    # splitting the remaining whitespace-separated fields.
+    close_paren = content.rfind(")")
+    if close_paren == -1:
+        return None
+    fields = content[close_paren + 1 :].split()
+    if len(fields) < 2:
+        return None
+    try:
+        return int(fields[1])
+    except ValueError:
+        return None
+
+
+def _find_descendant_pids(root_pid: int) -> set[int]:
+    """Recursively find all descendant PIDs of root_pid by walking /proc.
+
+    Unlike process-group membership, the PPID chain survives setsid() --
+    a process that detaches into its own session/process group (directly,
+    or via a wrapper like tmux/incus/docker that manages its own session
+    lifecycle) keeps its original parent. Walking /proc lets us find and
+    kill descendants that escaped the process group and that os.killpg()
+    can no longer reach.
+
+    Linux-only (relies on /proc). Returns an empty set on other platforms
+    or if /proc is unavailable.
+    """
+    try:
+        all_pids = [int(name) for name in os.listdir("/proc") if name.isdigit()]
+    except OSError:
+        return set()
+
+    children_by_ppid: dict[int, list[int]] = {}
+    for pid in all_pids:
+        ppid = _read_ppid(pid)
+        if ppid is not None:
+            children_by_ppid.setdefault(ppid, []).append(pid)
+
+    descendants: set[int] = set()
+    frontier = [root_pid]
+    while frontier:
+        current = frontier.pop()
+        for child in children_by_ppid.get(current, []):
+            if child not in descendants:
+                descendants.add(child)
+                frontier.append(child)
+    return descendants
+
+
+def _signal_pids(pids: set[int], sig: int) -> None:
+    """Best-effort send `sig` to every pid in `pids`, ignoring already-dead ones."""
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
     """
     Mount the bash tool.
@@ -659,21 +729,41 @@ SAFETY:
         except TimeoutError:
             # Kill the entire process group (all children) on Unix
             if pgid is not None and not is_windows:
+                # Walk /proc for descendants BEFORE killing anything.
+                # os.killpg() only reaches processes still in the original
+                # process group. A descendant that calls setsid (directly,
+                # or via a wrapper like tmux/incus/docker exec that manages
+                # its own session lifecycle) moves to a NEW process
+                # group/session, but its PPID chain back to `process.pid`
+                # is preserved -- setsid() only changes pgid/sid, it never
+                # reparents. Capturing descendants up front means we can
+                # still find them even if an intermediate process in the
+                # chain is killed first.
+                descendant_pids = _find_descendant_pids(process.pid)
                 try:
                     # Send SIGTERM to process group first (graceful shutdown)
                     os.killpg(pgid, signal.SIGTERM)
-                    # Give processes a moment to clean up
-                    await asyncio.sleep(0.5)
-                    # Force kill if still running
-                    try:
-                        os.killpg(pgid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass  # Already terminated
                 except ProcessLookupError:
                     pass  # Process group already gone
                 except PermissionError:
                     # Fall back to killing just the main process
                     process.kill()
+                # Belt and suspenders: also signal any descendants that
+                # escaped the process group and wouldn't receive the
+                # killpg() above.
+                _signal_pids(descendant_pids, signal.SIGTERM)
+
+                # Give processes a moment to clean up
+                await asyncio.sleep(0.5)
+
+                # Force kill if still running
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # Already terminated
+                except PermissionError:
+                    pass
+                _signal_pids(descendant_pids, signal.SIGKILL)
             else:
                 # Windows or no pgid: kill just the main process
                 process.kill()
