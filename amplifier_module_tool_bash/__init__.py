@@ -515,6 +515,7 @@ SAFETY:
                 "test -d /mnt/wsl",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.DEVNULL,  # Never inherit our fd 0
                 cwd=".",
             )
             await asyncio.wait_for(proc.communicate(), timeout=2)
@@ -644,6 +645,7 @@ SAFETY:
                         command,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
+                        stdin=asyncio.subprocess.DEVNULL,  # Never inherit our fd 0
                         cwd=self.working_dir,
                     )
                 else:
@@ -654,6 +656,7 @@ SAFETY:
                         command,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
+                        stdin=asyncio.subprocess.DEVNULL,  # Never inherit our fd 0
                         cwd=self.working_dir,
                     )
             else:
@@ -687,6 +690,7 @@ SAFETY:
                     *args,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    stdin=asyncio.subprocess.DEVNULL,  # Never inherit our fd 0
                     cwd=self.working_dir,
                 )
         else:
@@ -706,6 +710,7 @@ SAFETY:
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.DEVNULL,  # Never inherit our fd 0
                 executable="/bin/bash",  # Explicit bash (not /bin/sh)
                 cwd=self.working_dir,
                 start_new_session=True,  # Creates new process group for proper cleanup
