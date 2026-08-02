@@ -644,6 +644,7 @@ SAFETY:
                         command,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
+                        stdin=asyncio.subprocess.DEVNULL,  # Never hand the child our stdin
                         cwd=self.working_dir,
                     )
                 else:
@@ -654,6 +655,7 @@ SAFETY:
                         command,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
+                        stdin=asyncio.subprocess.DEVNULL,  # Never hand the child our stdin
                         cwd=self.working_dir,
                     )
             else:
@@ -706,6 +708,15 @@ SAFETY:
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                stdin=asyncio.subprocess.DEVNULL,  # Never hand the child our stdin --
+                # an agent-invoked command is non-interactive by definition, and
+                # inheriting the host's stdin (which, under the Amplifier CLI, is
+                # the real controlling TTY in prompt_toolkit's raw mode) lets a
+                # child like `ssh` (without `-n`) read from and reconfigure
+                # (tcsetattr) that terminal. That contends with prompt_toolkit's
+                # own terminal coordination and can stall the event loop -- the
+                # very hang this fixes. A command that reads stdin should see
+                # immediate EOF, not block on (and fight over) the user's TTY.
                 executable="/bin/bash",  # Explicit bash (not /bin/sh)
                 cwd=self.working_dir,
                 start_new_session=True,  # Creates new process group for proper cleanup
