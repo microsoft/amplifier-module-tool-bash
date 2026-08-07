@@ -94,6 +94,310 @@ def _signal_pids(pids: set[int], sig: int) -> None:
             pass
 
 
+# --- Windows orphan prevention (GAP-024) ---------------------------------
+#
+# On POSIX, `_run_command`'s existing timeout-cleanup path (`os.killpg` +
+# `_find_descendant_pids`) only covers the case where THIS module's own code
+# is still running to execute that cleanup -- e.g. the tool-level timeout
+# firing, or a normal asyncio.CancelledError propagating through a still-
+# alive event loop. It does NOT cover the host `amplifier.exe` process being
+# killed outright (crash, `Stop-Process`/`taskkill /F` on just the top PID,
+# a supervisor terminating only the parent) -- Windows has no equivalent of
+# POSIX's parent-death signal (`prctl(PR_SET_PDEATHSIG)`), so a subprocess
+# spawned here has no way to notice its parent is gone and no code of ours
+# runs to clean it up.
+#
+# Confirmed empirically (adversarial Windows re-test, alienware-r13):
+# spawning `sleep 60` via this module's WSL-routed path
+# (`wsl --exec bash -c ...`), then killing ONLY the top-level `amplifier.exe`
+# PID (no /T, no console Ctrl+C -- a plain `Stop-Process -Id <pid>`), left
+# the resulting `wsl.exe -> wsl.exe -> wslhost.exe` chain running with a
+# dead parent for the entire 60+ second observation window. This directly
+# contradicts the prior claim that killing only the top-level PID always
+# brings the whole tree down within ~2s -- that was true for amplifier's own
+# internal python-to-python self-relaunch (which IS covered by an existing
+# job-object association), but not for tool-call subprocesses spawned from
+# deep inside a running turn, which were never assigned to that job.
+#
+# Fix: create one Windows Job Object per process, with
+# JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE set, and assign every subprocess this
+# module spawns (on the foreground/tracked path only -- NOT
+# `_run_command_background`, whose whole point is to outlive us) to that
+# job. The job's only handle lives in this process; when this process ends
+# for ANY reason -- including a forceful kill that runs none of our own
+# Python cleanup code -- the OS closes that handle and the kernel itself
+# tears down every process still assigned to the job. This does not depend
+# on any application code running, so it also covers crashes.
+_windows_job_handle = None
+_windows_job_lock = None
+
+
+def _get_windows_job_object():
+    """Lazily create (once per process) a Job Object with kill-on-close set.
+
+    Returns the job handle (an int, per ctypes' ``wintypes.HANDLE``) or
+    ``None`` if creation failed for any reason -- callers must treat that as
+    "no extra protection available" and continue without raising, since
+    this is a defense-in-depth addition, not a required dependency for the
+    tool to function.
+    """
+    global _windows_job_handle, _windows_job_lock
+    if sys.platform != "win32":
+        return None
+    if _windows_job_lock is None:
+        import threading
+
+        _windows_job_lock = threading.Lock()
+    with _windows_job_lock:
+        if _windows_job_handle is not None:
+            return _windows_job_handle
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+            job = kernel32.CreateJobObjectW(None, None)
+            if not job:
+                logger.debug(
+                    "tool-bash: CreateJobObjectW failed (err=%s); "
+                    "proceeding without orphan protection",
+                    ctypes.get_last_error(),
+                )
+                return None
+
+            # JOBOBJECT_BASIC_LIMIT_INFORMATION + JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+            # layout (winnt.h). We only need to set LimitFlags on the basic
+            # struct embedded at the start of the extended one.
+            JobObjectExtendedLimitInformation = 9
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+            class IO_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("ReadOperationCount", ctypes.c_uint64),
+                    ("WriteOperationCount", ctypes.c_uint64),
+                    ("OtherOperationCount", ctypes.c_uint64),
+                    ("ReadTransferCount", ctypes.c_uint64),
+                    ("WriteTransferCount", ctypes.c_uint64),
+                    ("OtherTransferCount", ctypes.c_uint64),
+                ]
+
+            class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD),
+                ]
+
+            class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                    ("IoInfo", IO_COUNTERS),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+
+            ok = kernel32.SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            )
+            if not ok:
+                logger.debug(
+                    "tool-bash: SetInformationJobObject failed (err=%s); "
+                    "proceeding without orphan protection",
+                    ctypes.get_last_error(),
+                )
+                kernel32.CloseHandle(job)
+                return None
+
+            _windows_job_handle = job
+            return job
+        except Exception as e:  # pragma: no cover - defense in depth only
+            logger.debug(
+                "tool-bash: Windows job-object setup failed (%s); "
+                "proceeding without orphan protection",
+                e,
+            )
+            return None
+
+
+def _assign_to_windows_job(pid: int) -> bool:
+    """Best-effort: assign `pid` to this process's kill-on-close job object.
+
+    Returns whether assignment actually succeeded. Most callers only need
+    "did I do my best" semantics and can ignore the return value; the
+    descendant-walker below (GAP-013/GAP-028) uses it to log clearly.
+
+    Failure is intentionally swallowed as far as the CALLER's control flow
+    goes (logged at debug only) -- this is defense-in-depth cleanup, not a
+    correctness requirement for the command itself to run. A process that
+    can't be assigned (e.g. already exited, or running with different
+    privileges) just doesn't get the extra protection; it does not fail
+    the tool call.
+    """
+    if sys.platform != "win32":
+        return False
+    job = _get_windows_job_object()
+    if job is None:
+        return False
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        PROCESS_ALL_ACCESS = 0x1F0FFF
+        hproc = kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, pid)
+        if not hproc:
+            logger.debug(
+                "tool-bash: OpenProcess(%s) failed (err=%s); pid not job-protected",
+                pid,
+                ctypes.get_last_error(),
+            )
+            return False
+        try:
+            if not kernel32.AssignProcessToJobObject(job, hproc):
+                logger.debug(
+                    "tool-bash: AssignProcessToJobObject(%s) failed (err=%s); "
+                    "pid not job-protected",
+                    pid,
+                    ctypes.get_last_error(),
+                )
+                return False
+            return True
+        finally:
+            kernel32.CloseHandle(hproc)
+    except Exception as e:  # pragma: no cover - defense in depth only
+        logger.debug("tool-bash: failed to job-protect pid %s (%s)", pid, e)
+        return False
+
+
+def _enumerate_child_pids_windows(parent_pid: int) -> set[int]:
+    """Direct children of `parent_pid` via CreateToolhelp32Snapshot -- a
+    plain Win32 API walk of the system-wide process snapshot, filtered by
+    th32ParentProcessID. No WMI/CIM, no PowerShell subprocess.
+
+    Windows-only. Returns an empty set on any failure or on other platforms.
+    """
+    if sys.platform != "win32":
+        return set()
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        TH32CS_SNAPPROCESS = 0x00000002
+
+        class PROCESSENTRY32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_char * 260),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap in (-1, 0):
+            return set()
+        try:
+            entry = PROCESSENTRY32()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+            children: set[int] = set()
+            if not kernel32.Process32First(snap, ctypes.byref(entry)):
+                return set()
+            while True:
+                if entry.th32ParentProcessID == parent_pid:
+                    children.add(entry.th32ProcessID)
+                if not kernel32.Process32Next(snap, ctypes.byref(entry)):
+                    break
+            return children
+        finally:
+            kernel32.CloseHandle(snap)
+    except Exception as e:  # pragma: no cover - defense in depth only
+        logger.debug(
+            "tool-bash: descendant enumeration failed for %s (%s)", parent_pid, e
+        )
+        return set()
+
+
+async def _protect_windows_descendants(root_pid: int) -> None:
+    """Best-effort background task (GAP-013/GAP-028): assign every
+    descendant of `root_pid` to the same kill-on-close job object, not
+    just the immediate spawned PID.
+
+    Why this exists: `_assign_to_windows_job(process.pid)` alone was found
+    NOT to actually protect a WSL-routed command's real descendants.
+    Verified directly against the deployed code with the Win32
+    `IsProcessInJob` query (native Windows, alienware-r13): after spawning
+    `wsl --exec bash -c <cmd>` and calling `_assign_to_windows_job()` on
+    the immediate PID, that top-level PID *was* a job member -- but the
+    inner `wsl.exe` and `wslhost.exe` processes underneath it (the ones
+    that do the actual work, and the ones this module's own comments
+    elsewhere claim are covered) were NOT. Windows only auto-propagates
+    job membership to children spawned directly by a job-member process
+    via CreateProcess; WSL's inner process tree is connected to the outer
+    `wsl.exe` via an RPC/session channel rather than a plain parent-child
+    CreateProcess relationship, so it never inherits membership that way.
+
+    An external kill of the top-level process was still observed (same
+    investigation) to bring the whole WSL tree down in practice -- but via
+    WSL's own connection-teardown behavior when its client disconnects,
+    not via the job object. That is a real, currently-working mechanism,
+    but it is undocumented, owned by WSL rather than by us, and not
+    something this module actually controls or could adjust if it ever
+    changed. This function makes the protection deliberate instead of
+    coincidental: it walks the process tree (root_pid's children, and
+    their children) with a few short retries -- the WSL tree takes a
+    moment to fully spawn -- and assigns every PID it finds to the job
+    too, so the kill-on-close guarantee no longer depends on an external,
+    unverified assumption about WSL's behavior.
+
+    Fire-and-forget: runs concurrently with the command's own
+    process.communicate(), never blocks or delays the tool call, and
+    never raises (every failure path is caught and logged at debug only,
+    same contract as _assign_to_windows_job itself).
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        seen: set[int] = {root_pid}
+        for _ in range(8):  # poll for up to ~2s while the tree spawns
+            frontier = list(seen)
+            new_found = False
+            for pid in frontier:
+                for child in _enumerate_child_pids_windows(pid):
+                    if child not in seen:
+                        seen.add(child)
+                        _assign_to_windows_job(child)
+                        new_found = True
+            if not new_found and len(seen) > 1:
+                break  # tree grew at least once, then stopped changing
+            await asyncio.sleep(0.25)
+    except Exception as e:  # pragma: no cover - defense in depth only
+        logger.debug(
+            "tool-bash: descendant job-protection sweep failed for %s (%s)",
+            root_pid,
+            e,
+        )
+
+
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
     """
     Mount the bash tool.
@@ -647,6 +951,17 @@ SAFETY:
                         stdin=asyncio.subprocess.DEVNULL,  # Never hand the child our stdin
                         cwd=self.working_dir,
                     )
+                    # GAP-024: assign to a kill-on-close job object so this
+                    # (and its wslhost.exe descendants) can't outlive an
+                    # amplifier.exe that gets killed outright rather than
+                    # cancelled through our own code. See helper docstring.
+                    _assign_to_windows_job(process.pid)
+                    # GAP-013/GAP-028: the immediate wsl.exe PID being a job
+                    # member does NOT mean its real descendants (inner
+                    # wsl.exe, wslhost.exe) are -- verified directly with
+                    # IsProcessInJob. Sweep for them in the background; see
+                    # _protect_windows_descendants docstring for why.
+                    asyncio.create_task(_protect_windows_descendants(process.pid))
                 else:
                     # Git Bash or other: Direct exec with [bash, -c, command]
                     process = await asyncio.create_subprocess_exec(
@@ -658,6 +973,8 @@ SAFETY:
                         stdin=asyncio.subprocess.DEVNULL,  # Never hand the child our stdin
                         cwd=self.working_dir,
                     )
+                    _assign_to_windows_job(process.pid)  # GAP-024, see above
+                    asyncio.create_task(_protect_windows_descendants(process.pid))
             else:
                 # No bash found - fall back to limited cmd.exe behavior
                 # Check for shell features that won't work in cmd.exe
@@ -691,6 +1008,7 @@ SAFETY:
                     stderr=asyncio.subprocess.PIPE,
                     cwd=self.working_dir,
                 )
+                _assign_to_windows_job(process.pid)  # GAP-024, see helper docstring
         else:
             # Unix-like (Linux, macOS, WSL): Use real bash shell
             # This enables:
