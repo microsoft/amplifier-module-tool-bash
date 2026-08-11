@@ -14,6 +14,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 from typing import Any
 
 from amplifier_core import ModuleCoordinator
@@ -129,7 +130,61 @@ def _signal_pids(pids: set[int], sig: int) -> None:
 # tears down every process still assigned to the job. This does not depend
 # on any application code running, so it also covers crashes.
 _windows_job_handle = None
-_windows_job_lock = None
+# Created at import, not lazily. A `if _lock is None: _lock = Lock()` guard is
+# itself unsynchronised -- two OS threads can both see None and build two locks,
+# defeating the mutual exclusion it exists to provide. Nothing in this module
+# currently calls off the event-loop thread, so this was latent, but a
+# module-level construction costs nothing and removes the trap.
+_windows_job_lock = threading.Lock()
+
+# Background descendant-sweep tasks, held so the event loop cannot garbage
+# collect them mid-flight. asyncio.create_task returns a task that is only
+# weakly referenced by the loop; the docs are explicit that an unreferenced task
+# "may get garbage collected at any time, even before it's done". These sweeps
+# are the entire GAP-013/GAP-028 protection for WSL descendants, and if one
+# vanished the symptom would be indistinguishable from a silent assignment
+# failure.
+_windows_sweep_tasks: set = set()
+
+# One-shot flag so a job-object failure is reported loudly ONCE per process
+# rather than either spamming every command or (as before) being invisible.
+_windows_job_failure_reported = False
+
+
+def _report_windows_job_failure(message: str, *args) -> None:
+    """Report a job-object failure ONCE per process, at warning level.
+
+    These failures used to be logged at debug only and their return values
+    discarded by every caller, so the entire orphan-protection mechanism could
+    be inert with no operator-visible signal at all.
+
+    That matters most in exactly the environments this protection is for.
+    ``AssignProcessToJobObject`` fails when the process is already inside a job
+    that disallows the assignment -- the normal state under CI runners (GitHub
+    Actions wraps every step in a job object), Windows containers, and some
+    endpoint-security agents. In those environments this ships, every command
+    still "succeeds", and nothing anywhere indicates the protection never
+    engaged. A later orphan report would then be wrongly dismissed as
+    already-fixed.
+
+    Warning rather than error because the tool call itself is unaffected --
+    this is defense-in-depth, not a correctness requirement. Once per process
+    rather than per command because the cause is environmental and constant;
+    repeating it every command would be noise that trains people to ignore it.
+    """
+    global _windows_job_failure_reported
+    if _windows_job_failure_reported:
+        logger.debug("tool-bash: " + message, *args)
+        return
+    _windows_job_failure_reported = True
+    logger.warning(
+        "tool-bash: Windows orphan protection is NOT active for this process. "
+        + message
+        + ". Subprocesses spawned by this tool may survive an abrupt exit. "
+        "This is expected inside a restrictive parent job object (CI runners, "
+        "Windows containers); it is reported once per process.",
+        *args,
+    )
 
 
 def _get_windows_job_object():
@@ -157,12 +212,23 @@ def _get_windows_job_object():
 
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
+            # Declare signatures rather than letting ctypes default an
+            # undeclared return to c_int (32-bit signed), which truncates a
+            # 64-bit HANDLE. Win32 guarantees handle values are 32-bit
+            # significant, so the untyped form happens to work -- but relying on
+            # an unstated guarantee is how a silent, platform-specific
+            # corruption bug gets in.
+            kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+            kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+            kernel32.SetInformationJobObject.restype = wintypes.BOOL
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
             job = kernel32.CreateJobObjectW(None, None)
             if not job:
-                logger.debug(
-                    "tool-bash: CreateJobObjectW failed (err=%s); "
-                    "proceeding without orphan protection",
-                    ctypes.get_last_error(),
+                _report_windows_job_failure(
+                    "CreateJobObjectW failed (%s)",
+                    ctypes.WinError(ctypes.get_last_error()),
                 )
                 return None
 
@@ -215,10 +281,9 @@ def _get_windows_job_object():
                 ctypes.sizeof(info),
             )
             if not ok:
-                logger.debug(
-                    "tool-bash: SetInformationJobObject failed (err=%s); "
-                    "proceeding without orphan protection",
-                    ctypes.get_last_error(),
+                _report_windows_job_failure(
+                    "SetInformationJobObject failed (%s)",
+                    ctypes.WinError(ctypes.get_last_error()),
                 )
                 kernel32.CloseHandle(job)
                 return None
@@ -256,23 +321,49 @@ def _assign_to_windows_job(pid: int) -> bool:
     try:
         import ctypes
 
+        from ctypes import wintypes
+
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        ]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+        ]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
         PROCESS_ALL_ACCESS = 0x1F0FFF
         hproc = kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, pid)
         if not hproc:
+            # Debug, not warning: the overwhelmingly common cause is that the
+            # process already exited between spawn and assignment, which is
+            # benign and expected for fast commands. Distinct from the
+            # environmental failures reported once at warning level.
             logger.debug(
-                "tool-bash: OpenProcess(%s) failed (err=%s); pid not job-protected",
+                "tool-bash: OpenProcess(%s) failed (%s); pid not job-protected "
+                "(usually means it already exited)",
                 pid,
-                ctypes.get_last_error(),
+                ctypes.WinError(ctypes.get_last_error()),
             )
             return False
         try:
             if not kernel32.AssignProcessToJobObject(job, hproc):
-                logger.debug(
-                    "tool-bash: AssignProcessToJobObject(%s) failed (err=%s); "
-                    "pid not job-protected",
+                # This one IS environmental: the dominant cause is that this
+                # process already sits inside a job object that disallows the
+                # assignment -- the normal state under CI runners, Windows
+                # containers, and some endpoint-security agents. Report it
+                # loudly once, because in that case the protection is inert for
+                # every command and nothing else would ever say so.
+                _report_windows_job_failure(
+                    "AssignProcessToJobObject(pid=%s) failed (%s)",
                     pid,
-                    ctypes.get_last_error(),
+                    ctypes.WinError(ctypes.get_last_error()),
                 )
                 return False
             return True
@@ -335,6 +426,30 @@ def _enumerate_child_pids_windows(parent_pid: int) -> set[int]:
             "tool-bash: descendant enumeration failed for %s (%s)", parent_pid, e
         )
         return set()
+
+
+def _spawn_descendant_sweep(root_pid: int) -> None:
+    """Start the descendant sweep and KEEP A REFERENCE to the task.
+
+    ``asyncio.create_task`` returns a task the loop holds only weakly. The
+    stdlib docs are explicit: "Save a reference to the result of this
+    function... A task that isn't referenced elsewhere may get garbage
+    collected at any time, even before it's done."
+
+    These sweeps are the whole GAP-013/GAP-028 protection for WSL descendants
+    (inner ``wsl.exe``, ``wslhost.exe``), which do NOT inherit job membership
+    from the immediate spawned PID. If one were collected mid-flight, the
+    symptom would be orphaned processes with nothing in the logs -- outwardly
+    identical to a silent job-assignment failure, and correspondingly awful to
+    diagnose.
+
+    In practice the task is always parked on ``asyncio.sleep``, so the loop's
+    timer structures probably keep it reachable. "Probably" is not a property
+    worth betting a process-cleanup guarantee on, and a set costs nothing.
+    """
+    task = asyncio.create_task(_protect_windows_descendants(root_pid))
+    _windows_sweep_tasks.add(task)
+    task.add_done_callback(_windows_sweep_tasks.discard)
 
 
 async def _protect_windows_descendants(root_pid: int) -> None:
@@ -961,7 +1076,7 @@ SAFETY:
                     # wsl.exe, wslhost.exe) are -- verified directly with
                     # IsProcessInJob. Sweep for them in the background; see
                     # _protect_windows_descendants docstring for why.
-                    asyncio.create_task(_protect_windows_descendants(process.pid))
+                    _spawn_descendant_sweep(process.pid)
                 else:
                     # Git Bash or other: Direct exec with [bash, -c, command]
                     process = await asyncio.create_subprocess_exec(
@@ -974,7 +1089,7 @@ SAFETY:
                         cwd=self.working_dir,
                     )
                     _assign_to_windows_job(process.pid)  # GAP-024, see above
-                    asyncio.create_task(_protect_windows_descendants(process.pid))
+                    _spawn_descendant_sweep(process.pid)
             else:
                 # No bash found - fall back to limited cmd.exe behavior
                 # Check for shell features that won't work in cmd.exe
