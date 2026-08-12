@@ -1033,7 +1033,10 @@ SAFETY:
 
         On Unix-like systems (Linux, macOS, WSL), uses bash for full shell features.
         On Windows, attempts to find bash (Git Bash or WSL bash).
-        Falls back to cmd.exe with limitations if bash is not found.
+        If bash is not found, every command fails with an actionable error
+        naming the cause and how to install bash (Git for Windows or WSL) --
+        this tool's contract is POSIX shell semantics, so there is no
+        partial/degraded fallback (e.g. cmd.exe) for "simple" commands.
 
         Uses process groups for proper cleanup on timeout - kills entire process tree.
         """
@@ -1091,39 +1094,42 @@ SAFETY:
                     _assign_to_windows_job(process.pid)  # GAP-024, see above
                     _spawn_descendant_sweep(process.pid)
             else:
-                # No bash found - fall back to limited cmd.exe behavior
-                # Check for shell features that won't work in cmd.exe
-                shell_features = ["|", "&&", "||", "~", ">", "<", "2>&1", "$(", "`"]
-                if any(feature in command for feature in shell_features):
-                    return {
-                        "stdout": "",
-                        "stderr": (
-                            "Bash not found in PATH.\n"
-                            "\n"
-                            "Shell features like |, &&, ||, ~, redirects require bash.\n"
-                            "\n"
-                            "Install Git for Windows (includes Git Bash):\n"
-                            "  https://git-scm.com/download/win\n"
-                            "\n"
-                            "Or install WSL:\n"
-                            "  https://learn.microsoft.com/en-us/windows/wsl/install"
-                        ),
-                        "returncode": 1,
-                    }
-
-                # Windows: Use direct execution (no shell) for simple commands
-                try:
-                    args = shlex.split(command)
-                except ValueError as e:
-                    raise ValueError(f"Invalid command syntax: {e}")
-
-                process = await asyncio.create_subprocess_exec(
-                    *args,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=self.working_dir,
-                )
-                _assign_to_windows_job(process.pid)  # GAP-024, see helper docstring
+                # No bash found on Windows. This tool's entire contract is
+                # POSIX shell semantics (quoting, tilde expansion, &&/||/|,
+                # redirects, command substitution) -- there is no cmd.exe
+                # fallback, and there never should be a *partial* one.
+                # Previously, only commands containing an obvious shell
+                # metacharacter got this actionable error; anything else
+                # (`echo hello`, `ls`, `dir`, cmd.exe builtins like `cd`,
+                # `type`, `set`, `copy`, ...) fell through to
+                # shlex.split() + exec-with-no-shell-at-all and failed with
+                # a bare `[WinError 2] The system cannot find the file
+                # specified` -- naming neither the cause nor the fix. A
+                # tool named `bash` silently running some commands with no
+                # shell (or, worse, through cmd.exe) is a degraded state
+                # pretending to be a working one: the user's mental model
+                # breaks the moment quoting or a builtin behaves
+                # differently, with no signal why. Fail loud, unconditionally,
+                # for every command, with the real cause and the fix.
+                return {
+                    "stdout": "",
+                    "stderr": (
+                        "Bash not found in PATH.\n"
+                        "\n"
+                        "This tool requires bash for POSIX shell semantics "
+                        "(quoting, tilde expansion, pipes, redirects, "
+                        "command substitution). Without it, even simple "
+                        "commands cannot be run with correct, predictable "
+                        "behavior.\n"
+                        "\n"
+                        "Install Git for Windows (includes Git Bash):\n"
+                        "  https://git-scm.com/download/win\n"
+                        "\n"
+                        "Or install WSL:\n"
+                        "  https://learn.microsoft.com/en-us/windows/wsl/install"
+                    ),
+                    "returncode": 1,
+                }
         else:
             # Unix-like (Linux, macOS, WSL): Use real bash shell
             # This enables:
