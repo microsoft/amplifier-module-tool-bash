@@ -221,6 +221,12 @@ def _get_windows_job_object():
             kernel32.CreateJobObjectW.restype = wintypes.HANDLE
             kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
             kernel32.SetInformationJobObject.restype = wintypes.BOOL
+            kernel32.SetInformationJobObject.argtypes = [
+                wintypes.HANDLE,
+                ctypes.c_int,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+            ]
             kernel32.CloseHandle.restype = wintypes.BOOL
             kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
@@ -404,6 +410,24 @@ def _enumerate_child_pids_windows(parent_pid: int) -> set[int]:
             ]
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # Same reasoning as the job-object signatures above: CreateToolhelp32Snapshot
+        # returns a HANDLE, and leaving restype undeclared truncates it to a 32-bit
+        # c_int on 64-bit Windows. Declare all four signatures explicitly.
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.Process32First.restype = wintypes.BOOL
+        kernel32.Process32First.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(PROCESSENTRY32),
+        ]
+        kernel32.Process32Next.restype = wintypes.BOOL
+        kernel32.Process32Next.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(PROCESSENTRY32),
+        ]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
         snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
         if snap in (-1, 0):
             return set()
