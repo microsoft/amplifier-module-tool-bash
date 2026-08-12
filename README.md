@@ -62,10 +62,15 @@ Execute a bash command with platform-appropriate shell.
 - ✅ Heredocs: `cat <<EOF`
 
 **Windows (native)**:
-- ⚠️ Limited to simple commands
-- ❌ Shell operators not supported
-- 💡 Use full paths: `C:\Users\...` not `~`
-- 💡 For shell features, use WSL
+- ✅ Full bash shell if Git Bash or WSL bash is found (auto-detected)
+- ⚠️ Falls back to simple commands with no shell features if neither is found
+- 💡 Git Bash and WSL bash use different path/`$HOME`/toolchain conventions
+  (`/c/...` vs `/mnt/c/...`); the tool's `bash` description names which one
+  was resolved and its conventions. Set `windows_shell` config (or the
+  `AMPLIFIER_BASH_WINDOWS_SHELL` env var) to `"wsl"` or `"gitbash"` to force
+  a choice; default `"auto"` prefers whatever is found via `PATH` first
+  (WSL, if both are installed), falling back to well-known Git-for-Windows
+  install locations if `PATH` resolves nothing.
 
 ## Configuration
 

@@ -513,6 +513,148 @@ async def _protect_windows_descendants(root_pid: int) -> None:
         )
 
 
+# --- Windows shell resolution: Git Bash discoverability + observability --
+#
+# Root cause (confirmed on a real Windows 11 box, Git for Windows 2.55.0.3
+# installed a month prior): Git for Windows' *default* install puts
+# `Git\cmd` on PATH (git.exe lives there) but NOT `Git\bin` (bash.exe lives
+# there). Meanwhile `C:\Windows\System32\bash.exe` -- the WSL launcher
+# stub -- is effectively always on PATH. The result: `shutil.which("bash")`
+# resolves the WSL launcher every time, and Git Bash is unreachable no
+# matter what's installed -- even though a `bash` call against a WSL box
+# reaches a different filesystem, HOME, and toolchain (e.g. the WSL Linux
+# Python, not the Windows Python the user actually has installed) than a
+# `bash` call against Git Bash.
+#
+# Fix: (1) probe the well-known Git-for-Windows install locations directly
+# on the filesystem, independent of PATH, so Git Bash becomes genuinely
+# discoverable; (2) make the choice between WSL and Git Bash explicit and
+# overridable via `windows_shell` config / the AMPLIFIER_BASH_WINDOWS_SHELL
+# env var, defaulting to "auto" -- which preserves today's real-world
+# default behavior exactly (PATH-first resolution, so WSL wins when both
+# are present, unchanged for existing users) and only engages the new
+# filesystem probing as a fallback when PATH resolves nothing at all
+# (previously a hard "bash not found" error even with Git Bash installed).
+
+_WINDOWS_SHELL_PREFERENCE_ENV_VAR = "AMPLIFIER_BASH_WINDOWS_SHELL"
+_VALID_WINDOWS_SHELL_PREFERENCES = ("auto", "wsl", "gitbash")
+
+
+def _find_git_bash_executable() -> str | None:
+    """Probe well-known Git-for-Windows install locations for bash.exe,
+    independent of PATH (see module-level note above for why PATH alone
+    can never find it on a box where WSL is also installed).
+
+    Returns the first that exists on disk, or None.
+    """
+    candidates: list[str] = []
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    for env_var in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(env_var)
+        if base:
+            candidates.append(os.path.join(base, "Git", "bin", "bash.exe"))
+    if local_app_data:
+        candidates.append(
+            os.path.join(local_app_data, "Programs", "Git", "bin", "bash.exe")
+        )
+    # bash.exe under Git\bin is normally a copy of the one under
+    # Git\usr\bin; some installs (or a damaged/partial one) may only have
+    # the latter, so check it too before giving up.
+    for env_var in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(env_var)
+        if base:
+            candidates.append(os.path.join(base, "Git", "usr", "bin", "bash.exe"))
+    if local_app_data:
+        candidates.append(
+            os.path.join(local_app_data, "Programs", "Git", "usr", "bin", "bash.exe")
+        )
+
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _find_wsl_bash_executable() -> str | None:
+    """Probe the well-known WSL launcher location directly, independent of
+    PATH. In practice PATH always resolves this one (System32 is on every
+    Windows PATH by construction) -- this exists mainly for symmetry with
+    `_find_git_bash_executable` and to serve explicit `windows_shell="wsl"`
+    requests robustly even in an unusual PATH configuration.
+    """
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    candidate = os.path.join(system_root, "System32", "bash.exe")
+    return candidate if os.path.isfile(candidate) else None
+
+
+def _looks_like_wsl_launcher_path(path: str | None) -> bool:
+    """Cheap, SYNCHRONOUS classification used only to build the tool
+    description / startup log line at construction time (see
+    `BashTool._windows_shell_startup_note`) -- NOT used to decide how a
+    command actually executes. That decision always goes through
+    `BashTool._is_wsl_bash`'s authoritative `test -d /mnt/wsl` subprocess
+    check. On a real Windows install, the WSL launcher only ever lives at
+    `%SystemRoot%\\System32\\bash.exe`, so a path-string check is a safe,
+    deterministic stand-in for the one place we can't afford to spawn a
+    process (a synchronous constructor).
+    """
+    return path is not None and "system32" in path.lower()
+
+
+def _arbitrate_windows_shell(
+    preference: str,
+    path_bash: str | None,
+    path_bash_is_wsl: bool,
+    git_bash_candidate: str | None,
+    wsl_bash_candidate: str | None,
+) -> tuple[str | None, bool]:
+    """Pure decision: given what PATH resolves and what's discoverable via
+    the well-known install-location probes, decide which bash executable
+    wins and whether it's WSL bash.
+
+    Shared by the authoritative async resolution
+    (`BashTool._resolve_windows_bash`, using a real subprocess check for
+    `path_bash_is_wsl`) and the synchronous, approximate one used for the
+    startup log/description (using the path heuristic above) -- so the
+    *decision* logic lives in exactly one place, even though *how
+    WSL-ness is determined* legitimately differs between the two callers.
+
+    "auto" (default) preserves today's real-world behavior exactly: if
+    PATH resolves anything, it wins outright, full stop -- unchanged for
+    every existing user. Only when PATH resolves NOTHING does auto fall
+    back to the install-location probes (a strict improvement: previously
+    a hard error even with Git Bash installed). Explicit "wsl"/"gitbash"
+    preferences consider both PATH and the probes, so a user can force
+    Git Bash even where PATH resolves WSL's launcher first (the reported
+    bug) -- or force WSL even where PATH would resolve Git Bash first.
+    """
+    if preference == "auto" and path_bash:
+        return path_bash, path_bash_is_wsl
+
+    gitbash_exe = (
+        path_bash if (path_bash and not path_bash_is_wsl) else git_bash_candidate
+    )
+    wsl_exe = path_bash if (path_bash and path_bash_is_wsl) else wsl_bash_candidate
+
+    if preference == "gitbash" and gitbash_exe:
+        return gitbash_exe, False
+    if preference == "wsl" and wsl_exe:
+        return wsl_exe, True
+
+    if preference != "auto":
+        logger.warning(
+            "tool-bash: windows_shell=%r requested but not available on "
+            "this machine; falling back to auto-detection",
+            preference,
+        )
+
+    if wsl_exe:
+        return wsl_exe, True
+    if gitbash_exe:
+        return gitbash_exe, False
+    return None, False
+
+
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
     """
     Mount the bash tool.
@@ -529,6 +671,11 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             - allowed_commands: Whitelist of allowed commands (default: [])
             - denied_commands: Additional custom blocklist patterns (default: [])
             - safety_overrides: Fine-grained safety overrides dict with 'allow' and 'block' lists
+            - windows_shell: Windows-only. Which bash to prefer: "auto" (default,
+              PATH-first -- unchanged from prior behavior), "wsl", or "gitbash".
+              Also settable via the AMPLIFIER_BASH_WINDOWS_SHELL env var
+              (config takes precedence). See _arbitrate_windows_shell for
+              the full resolution/fallback rules.
 
     Returns:
         Optional cleanup function
@@ -633,6 +780,110 @@ SAFETY:
 
         # Cache for WSL bash detection to avoid repeated checks
         self._wsl_bash_cache: dict[str, bool] = {}
+
+        # Windows shell resolution: which bash (WSL vs Git Bash) to use, and
+        # whether the choice has been explicitly overridden. See the
+        # module-level note above `_arbitrate_windows_shell` for why PATH
+        # alone can't be trusted to ever surface Git Bash.
+        self._windows_shell_preference = self._resolve_windows_shell_preference(config)
+        # Cache for the AUTHORITATIVE resolution (async, subprocess-verified
+        # is_wsl check) used to actually execute commands. Resolved once per
+        # instance, not per command -- shared by both the foreground
+        # (_run_command) and background (_run_command_background) paths so
+        # they can never disagree (see _resolve_windows_bash docstring).
+        self._windows_bash_resolved: tuple[str | None, bool] | None = None
+
+        # Windows only: append a startup note (log + tool description) naming
+        # the shell we expect to resolve to, so a user/model isn't left to
+        # discover it only after a confusing failure hundreds of calls in
+        # (e.g. `python script.py` failing because WSL bash can't see the
+        # Windows Python). Uses a synchronous, approximate classification
+        # (`_looks_like_wsl_launcher_path`) since the authoritative,
+        # subprocess-verified check can't run inside a sync constructor --
+        # the real execution routing is unaffected and always uses that
+        # authoritative check via `_resolve_windows_bash`.
+        if sys.platform == "win32":
+            self.description = self.description + self._windows_shell_startup_note()
+
+    @staticmethod
+    def _resolve_windows_shell_preference(config: dict[str, Any]) -> str:
+        """Resolve the explicit Windows shell preference: `windows_shell`
+        config key, then the AMPLIFIER_BASH_WINDOWS_SHELL env var, then
+        "auto" (today's default: PATH-first, unchanged).
+
+        This module has no existing config-resolution system to plug into
+        (checked: no env vars, no config layer beyond plain config.get(...)
+        calls) -- a plain env var + config key, in the spirit of the
+        existing code, is the whole mechanism.
+        """
+        value = config.get("windows_shell") or os.environ.get(
+            _WINDOWS_SHELL_PREFERENCE_ENV_VAR
+        )
+        if not value:
+            return "auto"
+        value = value.strip().lower()
+        if value not in _VALID_WINDOWS_SHELL_PREFERENCES:
+            logger.warning(
+                "tool-bash: unknown windows_shell=%r (expected one of %s); "
+                "using 'auto'",
+                value,
+                _VALID_WINDOWS_SHELL_PREFERENCES,
+            )
+            return "auto"
+        return value
+
+    def _windows_shell_startup_note(self) -> str:
+        """Build the Windows-only description/log note naming the shell we
+        expect to resolve to and its path conventions -- the model needs
+        this BEFORE its first command (WSL mounts Windows drives at
+        /mnt/c/..., Git Bash at /c/...; guessing wrong -- not a hard
+        error -- was found to be the dominant failure mode across
+        comparable CLI agents). Approximate (see
+        `_looks_like_wsl_launcher_path`); the actual command routing
+        always uses the authoritative, subprocess-verified check in
+        `_resolve_windows_bash`.
+        """
+        path_bash = shutil.which("bash")
+        path_bash_is_wsl = _looks_like_wsl_launcher_path(path_bash)
+        exe, is_wsl = _arbitrate_windows_shell(
+            self._windows_shell_preference,
+            path_bash,
+            path_bash_is_wsl,
+            _find_git_bash_executable(),
+            _find_wsl_bash_executable(),
+        )
+
+        logger.info(
+            "tool-bash: Windows shell (approx; confirmed on first command) -> %s (%s)",
+            exe or "NOT FOUND",
+            "wsl" if is_wsl else ("gitbash" if exe else "none"),
+        )
+
+        override_hint = (
+            "\n(Override: set windows_shell config or "
+            f"{_WINDOWS_SHELL_PREFERENCE_ENV_VAR} env var to 'wsl' or "
+            "'gitbash'.)"
+        )
+        if exe is None:
+            return (
+                "\n\nWINDOWS SHELL: no bash found (WSL or Git Bash). Every "
+                "command will fail with an actionable error naming how to "
+                "install one."
+            )
+        if is_wsl:
+            return (
+                f"\n\nWINDOWS SHELL: WSL bash ({exe}). Windows drives are "
+                "mounted at /mnt/c/..., not /c/...; $HOME is the WSL "
+                "Linux home, not the Windows user profile; the toolchain "
+                "(e.g. python) is whatever is installed INSIDE that Linux "
+                "distro, not on Windows." + override_hint
+            )
+        return (
+            f"\n\nWINDOWS SHELL: Git Bash ({exe}). Windows drives are "
+            "mounted at /c/..., not /mnt/c/...; $HOME is the Windows user "
+            "profile; the toolchain (e.g. python) is whatever is "
+            "installed on Windows itself." + override_hint
+        )
 
     @property
     def input_schema(self) -> dict:
@@ -947,6 +1198,45 @@ SAFETY:
             self._wsl_bash_cache[bash_exe] = False
             return False
 
+    async def _resolve_windows_bash(self) -> tuple[str | None, bool]:
+        """Authoritative Windows shell resolution: which bash executable to
+        use, and whether it's WSL bash. Resolved ONCE per instance and
+        cached -- both `_run_command` and `_run_command_background` call
+        this (instead of each rolling their own PATH lookup / cache read)
+        so the two paths can never disagree about which shell is active.
+
+        Previously `_run_command_background` read
+        `self._wsl_bash_cache.get(bash_exe, False)` directly, defaulting to
+        False -- so a background command issued before any foreground
+        command routed WSL's bash.exe down the Git-Bash direct-exec
+        branch, bypassing the `wsl --exec` wrapper that exists
+        specifically to prevent premature variable expansion. Since this
+        method is itself async, both call sites can simply await it
+        instead.
+        """
+        if self._windows_bash_resolved is not None:
+            return self._windows_bash_resolved
+
+        path_bash = shutil.which("bash")
+        path_bash_is_wsl = await self._is_wsl_bash(path_bash) if path_bash else False
+
+        resolved = _arbitrate_windows_shell(
+            self._windows_shell_preference,
+            path_bash,
+            path_bash_is_wsl,
+            _find_git_bash_executable(),
+            _find_wsl_bash_executable(),
+        )
+        self._windows_bash_resolved = resolved
+
+        exe, is_wsl = resolved
+        logger.info(
+            "tool-bash: Windows shell resolved -> %s (%s)",
+            exe or "NOT FOUND",
+            "wsl" if is_wsl else ("gitbash" if exe else "none"),
+        )
+        return resolved
+
     async def _run_command_background(self, command: str) -> dict[str, Any]:
         """Run command in background, returning immediately with PID.
 
@@ -966,14 +1256,14 @@ SAFETY:
         devnull = subprocess.DEVNULL
 
         if is_windows:
-            # Windows background execution
-            bash_exe = shutil.which("bash")
+            # Windows background execution. Resolution is authoritative and
+            # shared with the foreground path via `_resolve_windows_bash`
+            # (this method is itself async, so it can simply await it) --
+            # see that method's docstring for why the previous
+            # `self._wsl_bash_cache.get(bash_exe, False)` read here could
+            # silently disagree with the foreground path.
+            bash_exe, is_wsl = await self._resolve_windows_bash()
             if bash_exe:
-                # Determine if WSL bash (requires special invocation)
-                # Note: We need to run detection synchronously here since Popen is sync
-                # Use cached result if available, otherwise assume not WSL for background
-                is_wsl = self._wsl_bash_cache.get(bash_exe, False)
-
                 if is_wsl:
                     # WSL bash: Use 'wsl --exec bash -c' to prevent premature variable expansion
                     process = subprocess.Popen(
@@ -1046,15 +1336,14 @@ SAFETY:
         pgid = None
 
         if is_windows:
-            # Try to find bash (Git Bash or WSL bash)
-            bash_exe = shutil.which("bash")
+            # Resolve which bash to use (Git Bash or WSL bash) -- shared,
+            # cached-once resolution; see `_resolve_windows_bash` docstring.
+            bash_exe, is_wsl = await self._resolve_windows_bash()
 
             if bash_exe:
                 # Bash found on Windows - use create_subprocess_exec to handle
                 # paths with spaces (e.g., "C:\Program Files\Git\bin\bash.exe")
                 # and properly handle WSL bash variable expansion
-                is_wsl = await self._is_wsl_bash(bash_exe)
-
                 if is_wsl:
                     # WSL bash: Use 'wsl --exec bash -c' to prevent premature
                     # variable expansion by the WSL launcher
