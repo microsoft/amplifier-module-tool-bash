@@ -394,13 +394,20 @@ def _enumerate_child_pids_windows(parent_pid: int) -> set[int]:
         from ctypes import wintypes
 
         TH32CS_SNAPPROCESS = 0x00000002
+        # CreateToolhelp32Snapshot signals failure by returning
+        # INVALID_HANDLE_VALUE, i.e. (HANDLE)-1 -- NOT NULL. With restype
+        # HANDLE (c_void_p), ctypes converts NULL to None and any other
+        # pointer value, including the -1 bit pattern, to a positive Python
+        # int (18446744073709551615 on 64-bit). Compare against the real
+        # sentinel, not the signed literal -1.
+        _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 
         class PROCESSENTRY32(ctypes.Structure):
             _fields_ = [
                 ("dwSize", wintypes.DWORD),
                 ("cntUsage", wintypes.DWORD),
                 ("th32ProcessID", wintypes.DWORD),
-                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+                ("th32DefaultHeapID", ctypes.c_size_t),
                 ("th32ModuleID", wintypes.DWORD),
                 ("cntThreads", wintypes.DWORD),
                 ("th32ParentProcessID", wintypes.DWORD),
@@ -429,7 +436,7 @@ def _enumerate_child_pids_windows(parent_pid: int) -> set[int]:
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
         snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-        if snap in (-1, 0):
+        if snap is None or snap == _INVALID_HANDLE_VALUE:
             return set()
         try:
             entry = PROCESSENTRY32()

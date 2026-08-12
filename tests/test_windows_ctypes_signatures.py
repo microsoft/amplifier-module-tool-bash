@@ -124,3 +124,34 @@ class TestWin32CallSignatures:
             "CloseHandle",
         ):
             _assert_signature_declared(kernel32, name)
+
+    def test_snapshot_invalid_handle_value_is_treated_as_failure(self) -> None:
+        """CreateToolhelp32Snapshot signals failure via INVALID_HANDLE_VALUE,
+        i.e. `(HANDLE)-1` -- NOT NULL. With a HANDLE (c_void_p) restype,
+        ctypes converts that bit pattern to a large *positive* Python int
+        (18446744073709551615 on 64-bit) -- never to the Python literal -1
+        or to 0. A guard written as ``if snap in (-1, 0)`` therefore never
+        matches this real failure value and falls through to call
+        Process32First/CloseHandle on an invalid handle.
+
+        This test must fail against that old guard: with it restored, the
+        invalid-handle value is not caught, so both Process32First and
+        CloseHandle get called on the invalid handle below (Process32First
+        is stubbed to return False purely so the walk terminates instead of
+        spinning forever on an always-truthy MagicMock Process32Next --
+        it does NOT make the old guard correct).
+        """
+        kernel32 = MagicMock(name="kernel32")
+        kernel32.CreateToolhelp32Snapshot.return_value = ctypes.c_void_p(-1).value
+        kernel32.Process32First.return_value = False
+        windll_factory = MagicMock(return_value=kernel32)
+
+        with (
+            patch("amplifier_module_tool_bash.sys.platform", "win32"),
+            patch.object(ctypes, "WinDLL", windll_factory, create=True),
+        ):
+            children = mod._enumerate_child_pids_windows(1234)
+
+        assert children == set()
+        kernel32.Process32First.assert_not_called()
+        kernel32.CloseHandle.assert_not_called()
