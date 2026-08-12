@@ -49,6 +49,15 @@ async def test_simple_command_gets_actionable_error_when_bash_missing() -> None:
     with (
         patch("amplifier_module_tool_bash.sys.platform", "win32"),
         patch("amplifier_module_tool_bash.shutil.which", return_value=None),
+        # Neutralising PATH alone is NOT "no bash on this machine" any more.
+        # Git Bash discovery probes well-known install locations directly on
+        # the filesystem, precisely because Git for Windows never puts
+        # Git\bin on PATH. On a real Windows box with Git installed, this
+        # test passed on Linux (where it is skipped) and failed on Windows:
+        # bash WAS found, the actionable error never fired, and execution
+        # reached create_subprocess_exec.
+        patch("amplifier_module_tool_bash._find_git_bash_executable", return_value=None),
+        patch("amplifier_module_tool_bash._find_wsl_bash_executable", return_value=None),
         patch("amplifier_module_tool_bash.asyncio.create_subprocess_exec", exec_spy),
     ):
         result = await tool._run_command("echo hello", timeout=5)
@@ -84,6 +93,11 @@ async def test_shell_metacharacter_command_still_gets_actionable_error() -> None
     with (
         patch("amplifier_module_tool_bash.sys.platform", "win32"),
         patch("amplifier_module_tool_bash.shutil.which", return_value=None),
+        # See the note in the test above: PATH is no longer the only way bash
+        # is found on Windows, so a "no bash" simulation has to neutralise the
+        # filesystem probes too.
+        patch("amplifier_module_tool_bash._find_git_bash_executable", return_value=None),
+        patch("amplifier_module_tool_bash._find_wsl_bash_executable", return_value=None),
         patch("amplifier_module_tool_bash.asyncio.create_subprocess_exec", exec_spy),
     ):
         result = await tool._run_command("ls -la | head -3", timeout=5)
