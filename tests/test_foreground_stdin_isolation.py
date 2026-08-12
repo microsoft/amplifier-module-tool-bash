@@ -38,6 +38,21 @@ on Windows (the Windows foreground path is fixed by the same change but
 is not covered by this pty-based test).
 """
 
+import sys
+
+import pytest
+
+# `pty` is POSIX-only and is imported at module scope, so on Windows this
+# file fails at COLLECTION -- a hard ERROR, not a skip. The pytestmark
+# below is evaluated only AFTER the module body has already executed, so
+# it cannot prevent the import from raising. An ImportError during
+# collection is indistinguishable in CI output from a real breakage.
+if sys.platform == "win32":
+    pytest.skip(
+        "POSIX-only: requires pty, which has no Windows equivalent",
+        allow_module_level=True,
+    )
+
 import asyncio
 import contextlib
 import os
