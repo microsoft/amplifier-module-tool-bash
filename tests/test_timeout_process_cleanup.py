@@ -18,6 +18,7 @@ os.killpg semantics that don't exist on Windows).
 
 import asyncio
 import os
+import shlex
 import signal
 import sys
 
@@ -55,15 +56,44 @@ class TestTimeoutKillsSetsidDetachedDescendants:
 
     @pytest.mark.asyncio
     async def test_setsid_detached_child_is_killed_on_timeout(self, tmp_path):
-        """A `setsid`-detached grandchild must not survive timeout cleanup."""
+        """A setsid-detached grandchild must not survive timeout cleanup.
+
+        Detachment is performed via `os.setsid()` inside an inline Python
+        process rather than shelling out to the `setsid(1)` binary: `setsid`
+        is a util-linux program that Linux ships but macOS does not (no
+        `/usr/bin/setsid` on macOS -- confirmed via
+        https://stackoverflow.com/questions/36590905, and the existence of
+        third-party "ersatz setsid" replacements written specifically to fill
+        that gap on macOS). Shelling out to `setsid bash -c '...'` made this
+        test *vacuous* on macOS: the subshell failed instantly with
+        "command not found", no marker was ever written, and the test failed
+        at the marker-existence assertion without ever exercising the actual
+        cleanup hazard.
+
+        Calling `os.setsid()` directly is portable (it's a POSIX syscall
+        exposed by Python's `os` module on every Unix, including macOS) and
+        exercises the identical hazard: a descendant that moves itself to a
+        new session/process group, whose PPID chain back to the timed-out
+        command is preserved (setsid() never reparents).
+        """
         marker = tmp_path / "detached_child.pid"
         tool = BashTool({})
 
-        # Spawn a detached grandchild via setsid that records its own PID,
-        # then sleeps far longer than the tool timeout. The outer `sleep`
-        # keeps the parent bash alive past the timeout so the tool actually
-        # times out (rather than exiting cleanly on its own).
-        command = f"setsid bash -c 'echo $$ > {marker}; sleep 60' & sleep 30"
+        # Spawn a detached grandchild that calls os.setsid() on itself,
+        # records its own PID, then sleeps far longer than the tool timeout.
+        # The outer `sleep` keeps the parent bash alive past the timeout so
+        # the tool actually times out (rather than exiting cleanly on its
+        # own).
+        detach_snippet = (
+            "import os\n"
+            "os.setsid()\n"
+            f"open({str(marker)!r}, 'w').write(str(os.getpid()))\n"
+            "import time\n"
+            "time.sleep(60)\n"
+        )
+        command = (
+            f"{shlex.quote(sys.executable)} -c {shlex.quote(detach_snippet)} & sleep 30"
+        )
 
         detached_pid: int | None = None
         try:

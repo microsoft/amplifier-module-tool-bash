@@ -51,29 +51,13 @@ def _read_ppid(pid: int) -> int | None:
         return None
 
 
-def _find_descendant_pids(root_pid: int) -> set[int]:
-    """Recursively find all descendant PIDs of root_pid by walking /proc.
-
-    Unlike process-group membership, the PPID chain survives setsid() --
-    a process that detaches into its own session/process group (directly,
-    or via a wrapper like tmux/incus/docker that manages its own session
-    lifecycle) keeps its original parent. Walking /proc lets us find and
-    kill descendants that escaped the process group and that os.killpg()
-    can no longer reach.
-
-    Linux-only (relies on /proc). Returns an empty set on other platforms
-    or if /proc is unavailable.
-    """
-    try:
-        all_pids = [int(name) for name in os.listdir("/proc") if name.isdigit()]
-    except OSError:
-        return set()
-
+def _descendants_from_pid_ppid_pairs(
+    root_pid: int, pairs: list[tuple[int, int]]
+) -> set[int]:
+    """Walk a flat list of (pid, ppid) pairs to find all descendants of root_pid."""
     children_by_ppid: dict[int, list[int]] = {}
-    for pid in all_pids:
-        ppid = _read_ppid(pid)
-        if ppid is not None:
-            children_by_ppid.setdefault(ppid, []).append(pid)
+    for pid, ppid in pairs:
+        children_by_ppid.setdefault(ppid, []).append(pid)
 
     descendants: set[int] = set()
     frontier = [root_pid]
@@ -84,6 +68,68 @@ def _find_descendant_pids(root_pid: int) -> set[int]:
                 descendants.add(child)
                 frontier.append(child)
     return descendants
+
+
+def _find_descendant_pids_via_ps(root_pid: int) -> set[int]:
+    """Fallback descendant walk using `ps` for POSIX systems without /proc
+    (e.g. macOS, which has no /proc filesystem).
+
+    `ps -A -o pid=,ppid=` is portable across GNU (Linux) and BSD (macOS) ps
+    implementations: `-A` selects every process, and the trailing `=` after
+    each column name suppresses the header on both. Returns an empty set on
+    any failure (missing `ps`, unexpected output, etc.) -- this is a
+    best-effort fallback, not a hard requirement.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-A", "-o", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+
+    pairs: list[tuple[int, int]] = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        try:
+            pairs.append((int(fields[0]), int(fields[1])))
+        except ValueError:
+            continue
+
+    return _descendants_from_pid_ppid_pairs(root_pid, pairs)
+
+
+def _find_descendant_pids(root_pid: int) -> set[int]:
+    """Recursively find all descendant PIDs of root_pid.
+
+    Unlike process-group membership, the PPID chain survives setsid() --
+    a process that detaches into its own session/process group (directly,
+    or via a wrapper like tmux/incus/docker that manages its own session
+    lifecycle) keeps its original parent. Walking the process table lets us
+    find and kill descendants that escaped the process group and that
+    os.killpg() can no longer reach.
+
+    Prefers /proc (Linux) for speed and reliability; falls back to `ps`
+    (e.g. macOS, which has no /proc) when /proc is unavailable. Returns an
+    empty set if neither source is usable.
+    """
+    try:
+        all_pids = [int(name) for name in os.listdir("/proc") if name.isdigit()]
+    except OSError:
+        return _find_descendant_pids_via_ps(root_pid)
+
+    pairs: list[tuple[int, int]] = []
+    for pid in all_pids:
+        ppid = _read_ppid(pid)
+        if ppid is not None:
+            pairs.append((pid, ppid))
+
+    return _descendants_from_pid_ppid_pairs(root_pid, pairs)
 
 
 def _signal_pids(pids: set[int], sig: int) -> None:
