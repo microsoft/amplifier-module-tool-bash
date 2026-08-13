@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: pytest (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    # This suite is seconds on every platform. A hang must fail LOUDLY and
+    # fast, not sit burning runner time until the 6h default -- a job stuck at
+    # "in_progress" reads as "not done yet" rather than "broken", which is how
+    # a false green gets merged.
+    timeout-minutes: 10
+    strategy:
+      # A Windows failure must not cancel the POSIX legs. Those tell us whether
+      # we regressed the population that works today, which is the more
+      # expensive outcome by far.
+      fail-fast: false
+      matrix:
+        # requires-python = ">=3.11" -- cover the floor and a current minor.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Run test suite
+        # windows-latest is the point of this workflow. This module's entire
+        # Windows surface is shell resolution -- Git Bash vs WSL vs neither --
+        # and every test guarding it is skipped by platform guard on POSIX, so
+        # before this job those tests ran NOWHERE. Two of them were green on
+        # Linux for days and failed the first time they actually executed on
+        # Windows.
+        #
+        # Honest limit: GitHub's Windows runner has no WSL, so the `wsl --exec`
+        # path cannot be exercised here. It DOES have Git Bash, so the
+        # Git-Bash and no-bash paths are covered. WSL behaviour still needs a
+        # real machine.
+        run: uv run pytest -q
