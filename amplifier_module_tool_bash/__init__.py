@@ -24,6 +24,44 @@ from .safety import SafetyConfig, SafetyValidator
 
 logger = logging.getLogger(__name__)
 
+TIMEOUT_MIN_SECONDS = 1
+TIMEOUT_MAX_SECONDS = 3600
+
+
+def _validate_timeout_seconds(value: Any, *, source: str) -> int:
+    """Validate a timeout value (seconds) from either config or caller input.
+
+    Requirements:
+      - must be an int (bool rejected)
+      - 1 <= value <= 3600
+
+    Raises:
+        TypeError: If the value is not an integer (including bool).
+        ValueError: If the integer is outside the supported range.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(
+            f"Invalid {source} timeout: timeout must be an integer number of seconds "
+            f"between {TIMEOUT_MIN_SECONDS} and {TIMEOUT_MAX_SECONDS} (got {value!r})."
+        )
+    if value < TIMEOUT_MIN_SECONDS:
+        raise ValueError(
+            f"Invalid {source} timeout: timeout must be an integer number of seconds "
+            f"between {TIMEOUT_MIN_SECONDS} and {TIMEOUT_MAX_SECONDS} (got {value!r})."
+        )
+    if value > TIMEOUT_MAX_SECONDS:
+        suggestion = ""
+        if value % 1000 == 0:
+            as_seconds = value // 1000
+            if TIMEOUT_MIN_SECONDS <= as_seconds <= TIMEOUT_MAX_SECONDS:
+                suggestion = f" It looks like you passed milliseconds; did you mean {as_seconds} seconds?"
+        raise ValueError(
+            f"Invalid {source} timeout: timeout is specified in seconds and must be <= "
+            f"{TIMEOUT_MAX_SECONDS} (got {value!r}).{suggestion}"
+        )
+    return value
+
 
 def _read_ppid(pid: int) -> int | None:
     """Read a process's parent PID from /proc/<pid>/stat (Linux only).
@@ -730,6 +768,82 @@ def _arbitrate_windows_shell(
     if gitbash_exe:
         return gitbash_exe, False
     return None, False
+async def _cleanup_process_tree(
+    process: asyncio.subprocess.Process, *, pgid: int | None, is_windows: bool
+) -> None:
+    """Best-effort termination of a subprocess and its descendants.
+
+    Mirrors the tool's timeout cleanup behavior:
+      - kill the process group (Unix) when available
+      - on Linux, also signal setsid()-detached descendants discovered via /proc
+      - wait briefly, then SIGKILL
+      - reap via communicate()
+    """
+
+    if pgid is not None and not is_windows:
+        # Walk /proc for descendants BEFORE killing anything.
+        descendant_pids = _find_descendant_pids(process.pid)
+        try:
+            # Send SIGTERM to process group first (graceful shutdown)
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # Process group already gone
+        except PermissionError:
+            # Fall back to killing just the main process
+            process.kill()
+
+        # Belt and suspenders: also signal any descendants that escaped the
+        # process group and wouldn't receive the killpg() above.
+        _signal_pids(descendant_pids, signal.SIGTERM)
+
+        # Give processes a moment to clean up
+        await asyncio.sleep(0.5)
+
+        # Force kill if still running
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass  # Already terminated
+        except PermissionError:
+            pass
+        _signal_pids(descendant_pids, signal.SIGKILL)
+    else:
+        # Windows or no pgid: kill just the main process
+        process.kill()
+
+    # Reap / close pipes (best-effort)
+    try:
+        await asyncio.wait_for(process.communicate(), timeout=5)
+    except TimeoutError:
+        pass  # Best effort cleanup
+
+
+async def _await_process_tree_cleanup(
+    process: asyncio.subprocess.Process, *, pgid: int | None, is_windows: bool
+) -> None:
+    """Run process-tree cleanup to completion despite repeated cancellation.
+
+    If cancellation arrives while cleanup is running, defer propagation until
+    the bounded cleanup task finishes, then raise CancelledError.
+    """
+
+    cleanup_task = asyncio.create_task(
+        _cleanup_process_tree(process, pgid=pgid, is_windows=is_windows)
+    )
+    cancellation_received = False
+
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            cancellation_received = True
+            continue
+        except Exception as cleanup_error:  # noqa: BLE001
+            logger.error("Process cleanup failed: %s", cleanup_error)
+            break
+
+    if cancellation_received:
+        raise asyncio.CancelledError()
 
 
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
@@ -828,7 +942,9 @@ SAFETY:
         """
         self.config = config
         self.require_approval = config.get("require_approval", True)
-        self.timeout = config.get("timeout", 30)
+        self.timeout = _validate_timeout_seconds(
+            config.get("timeout", 30), source="config"
+        )
         self.working_dir = config.get("working_dir", ".")
         # Output limiting to prevent context overflow
         self.max_output_bytes = config.get(
@@ -971,6 +1087,8 @@ SAFETY:
                 "command": {"type": "string", "description": "Bash command to execute"},
                 "timeout": {
                     "type": "integer",
+                    "minimum": TIMEOUT_MIN_SECONDS,
+                    "maximum": TIMEOUT_MAX_SECONDS,
                     "description": "Command timeout in seconds (default: 30). Increase for builds, tests, or monitoring. Use run_in_background for truly indefinite processes.",
                 },
                 "run_in_background": {
@@ -1010,7 +1128,18 @@ SAFETY:
                 success=False, output=error_msg, error={"message": error_msg}
             )
 
-        timeout = input.get("timeout", self.timeout)
+        if "timeout" in input:
+            try:
+                timeout = _validate_timeout_seconds(
+                    input.get("timeout"), source="caller"
+                )
+            except (TypeError, ValueError) as e:
+                error_msg = str(e)
+                return ToolResult(
+                    success=False, output=error_msg, error={"message": error_msg}
+                )
+        else:
+            timeout = self.timeout
         run_in_background = input.get("run_in_background", False)
 
         # Safety checks using profile-based validator
@@ -1543,50 +1672,13 @@ SAFETY:
             }
 
         except TimeoutError:
-            # Kill the entire process group (all children) on Unix
-            if pgid is not None and not is_windows:
-                # Walk /proc for descendants BEFORE killing anything.
-                # os.killpg() only reaches processes still in the original
-                # process group. A descendant that calls setsid (directly,
-                # or via a wrapper like tmux/incus/docker exec that manages
-                # its own session lifecycle) moves to a NEW process
-                # group/session, but its PPID chain back to `process.pid`
-                # is preserved -- setsid() only changes pgid/sid, it never
-                # reparents. Capturing descendants up front means we can
-                # still find them even if an intermediate process in the
-                # chain is killed first.
-                descendant_pids = _find_descendant_pids(process.pid)
-                try:
-                    # Send SIGTERM to process group first (graceful shutdown)
-                    os.killpg(pgid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass  # Process group already gone
-                except PermissionError:
-                    # Fall back to killing just the main process
-                    process.kill()
-                # Belt and suspenders: also signal any descendants that
-                # escaped the process group and wouldn't receive the
-                # killpg() above.
-                _signal_pids(descendant_pids, signal.SIGTERM)
-
-                # Give processes a moment to clean up
-                await asyncio.sleep(0.5)
-
-                # Force kill if still running
-                try:
-                    os.killpg(pgid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass  # Already terminated
-                except PermissionError:
-                    pass
-                _signal_pids(descendant_pids, signal.SIGKILL)
-            else:
-                # Windows or no pgid: kill just the main process
-                process.kill()
-
-            # Clean up
-            try:
-                await asyncio.wait_for(process.communicate(), timeout=5)
-            except TimeoutError:
-                pass  # Best effort cleanup
+            await _await_process_tree_cleanup(process, pgid=pgid, is_windows=is_windows)
+            raise
+        except asyncio.CancelledError:
+            # If our caller cancels the tool call, ensure we still clean up
+            # the spawned process tree (including the existing Linux /proc
+            # strategy for setsid()-detached descendants), then re-raise
+            # cancellation. The shared helper also defers repeated cancellation
+            # until the bounded cleanup task finishes.
+            await _await_process_tree_cleanup(process, pgid=pgid, is_windows=is_windows)
             raise
