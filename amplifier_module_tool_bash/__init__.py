@@ -9,7 +9,6 @@ __amplifier_module_type__ = "tool"
 import asyncio
 import logging
 import os
-import shlex
 import shutil
 import signal
 import subprocess
@@ -654,6 +653,27 @@ async def _protect_windows_descendants(root_pid: int) -> None:
 _WINDOWS_SHELL_PREFERENCE_ENV_VAR = "AMPLIFIER_BASH_WINDOWS_SHELL"
 _VALID_WINDOWS_SHELL_PREFERENCES = ("auto", "wsl", "gitbash")
 
+# Actionable "no bash found on Windows" message, shared verbatim by both the
+# foreground (`_run_command`) and background (`_run_command_background`)
+# no-bash branches -- see each call site for why there is no degraded
+# fallback (e.g. cmd.exe, or exec-with-no-shell-at-all) for "simple"
+# commands.
+_WINDOWS_NO_BASH_ERROR = (
+    "Bash not found in PATH.\n"
+    "\n"
+    "This tool requires bash for POSIX shell semantics "
+    "(quoting, tilde expansion, pipes, redirects, "
+    "command substitution). Without it, even simple "
+    "commands cannot be run with correct, predictable "
+    "behavior.\n"
+    "\n"
+    "Install Git for Windows (includes Git Bash):\n"
+    "  https://git-scm.com/download/win\n"
+    "\n"
+    "Or install WSL:\n"
+    "  https://learn.microsoft.com/en-us/windows/wsl/install"
+)
+
 
 def _find_git_bash_executable() -> str | None:
     """Probe well-known Git-for-Windows install locations for bash.exe,
@@ -1173,6 +1193,15 @@ SAFETY:
             if run_in_background:
                 # Execute command in background and return immediately
                 result = await self._run_command_background(command)
+                if "error" in result:
+                    # No bash on Windows: nothing was launched (no PID),
+                    # surface the same actionable error the foreground
+                    # path returns instead of a misleading success.
+                    return ToolResult(
+                        success=False,
+                        output=result["error"],
+                        error={"message": result["error"]},
+                    )
                 return ToolResult(
                     success=True,
                     output={
@@ -1493,20 +1522,14 @@ SAFETY:
                         | subprocess.CREATE_NEW_PROCESS_GROUP,
                     )
             else:
-                try:
-                    args = shlex.split(command)
-                except ValueError as e:
-                    raise ValueError(f"Invalid command syntax: {e}")
-
-                process = subprocess.Popen(
-                    args,
-                    stdout=devnull,
-                    stderr=devnull,
-                    stdin=devnull,
-                    cwd=self.working_dir,
-                    creationflags=subprocess.DETACHED_PROCESS
-                    | subprocess.CREATE_NEW_PROCESS_GROUP,
-                )
+                # No bash found on Windows. Same contract as the
+                # foreground path (`_run_command`): a tool named
+                # `bash` silently running a command with no shell at
+                # all (or raising a bare OS error for anything else)
+                # is a degraded state pretending to be a working one.
+                # Surface the same actionable error instead of
+                # attempting to run anything.
+                return {"pid": None, "error": _WINDOWS_NO_BASH_ERROR}
         else:
             # Unix-like: Use start_new_session to create new session, fully detached
             process = subprocess.Popen(
@@ -1608,21 +1631,7 @@ SAFETY:
                 # for every command, with the real cause and the fix.
                 return {
                     "stdout": "",
-                    "stderr": (
-                        "Bash not found in PATH.\n"
-                        "\n"
-                        "This tool requires bash for POSIX shell semantics "
-                        "(quoting, tilde expansion, pipes, redirects, "
-                        "command substitution). Without it, even simple "
-                        "commands cannot be run with correct, predictable "
-                        "behavior.\n"
-                        "\n"
-                        "Install Git for Windows (includes Git Bash):\n"
-                        "  https://git-scm.com/download/win\n"
-                        "\n"
-                        "Or install WSL:\n"
-                        "  https://learn.microsoft.com/en-us/windows/wsl/install"
-                    ),
+                    "stderr": _WINDOWS_NO_BASH_ERROR,
                     "returncode": 1,
                 }
         else:
