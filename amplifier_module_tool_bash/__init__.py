@@ -14,6 +14,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 from typing import Any
 
 from amplifier_core import ModuleCoordinator
@@ -50,29 +51,13 @@ def _read_ppid(pid: int) -> int | None:
         return None
 
 
-def _find_descendant_pids(root_pid: int) -> set[int]:
-    """Recursively find all descendant PIDs of root_pid by walking /proc.
-
-    Unlike process-group membership, the PPID chain survives setsid() --
-    a process that detaches into its own session/process group (directly,
-    or via a wrapper like tmux/incus/docker that manages its own session
-    lifecycle) keeps its original parent. Walking /proc lets us find and
-    kill descendants that escaped the process group and that os.killpg()
-    can no longer reach.
-
-    Linux-only (relies on /proc). Returns an empty set on other platforms
-    or if /proc is unavailable.
-    """
-    try:
-        all_pids = [int(name) for name in os.listdir("/proc") if name.isdigit()]
-    except OSError:
-        return set()
-
+def _descendants_from_pid_ppid_pairs(
+    root_pid: int, pairs: list[tuple[int, int]]
+) -> set[int]:
+    """Walk a flat list of (pid, ppid) pairs to find all descendants of root_pid."""
     children_by_ppid: dict[int, list[int]] = {}
-    for pid in all_pids:
-        ppid = _read_ppid(pid)
-        if ppid is not None:
-            children_by_ppid.setdefault(ppid, []).append(pid)
+    for pid, ppid in pairs:
+        children_by_ppid.setdefault(ppid, []).append(pid)
 
     descendants: set[int] = set()
     frontier = [root_pid]
@@ -85,6 +70,68 @@ def _find_descendant_pids(root_pid: int) -> set[int]:
     return descendants
 
 
+def _find_descendant_pids_via_ps(root_pid: int) -> set[int]:
+    """Fallback descendant walk using `ps` for POSIX systems without /proc
+    (e.g. macOS, which has no /proc filesystem).
+
+    `ps -A -o pid=,ppid=` is portable across GNU (Linux) and BSD (macOS) ps
+    implementations: `-A` selects every process, and the trailing `=` after
+    each column name suppresses the header on both. Returns an empty set on
+    any failure (missing `ps`, unexpected output, etc.) -- this is a
+    best-effort fallback, not a hard requirement.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-A", "-o", "pid=,ppid="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return set()
+
+    pairs: list[tuple[int, int]] = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        try:
+            pairs.append((int(fields[0]), int(fields[1])))
+        except ValueError:
+            continue
+
+    return _descendants_from_pid_ppid_pairs(root_pid, pairs)
+
+
+def _find_descendant_pids(root_pid: int) -> set[int]:
+    """Recursively find all descendant PIDs of root_pid.
+
+    Unlike process-group membership, the PPID chain survives setsid() --
+    a process that detaches into its own session/process group (directly,
+    or via a wrapper like tmux/incus/docker that manages its own session
+    lifecycle) keeps its original parent. Walking the process table lets us
+    find and kill descendants that escaped the process group and that
+    os.killpg() can no longer reach.
+
+    Prefers /proc (Linux) for speed and reliability; falls back to `ps`
+    (e.g. macOS, which has no /proc) when /proc is unavailable. Returns an
+    empty set if neither source is usable.
+    """
+    try:
+        all_pids = [int(name) for name in os.listdir("/proc") if name.isdigit()]
+    except OSError:
+        return _find_descendant_pids_via_ps(root_pid)
+
+    pairs: list[tuple[int, int]] = []
+    for pid in all_pids:
+        ppid = _read_ppid(pid)
+        if ppid is not None:
+            pairs.append((pid, ppid))
+
+    return _descendants_from_pid_ppid_pairs(root_pid, pairs)
+
+
 def _signal_pids(pids: set[int], sig: int) -> None:
     """Best-effort send `sig` to every pid in `pids`, ignoring already-dead ones."""
     for pid in pids:
@@ -92,6 +139,597 @@ def _signal_pids(pids: set[int], sig: int) -> None:
             os.kill(pid, sig)
         except (ProcessLookupError, PermissionError):
             pass
+
+
+# --- Windows orphan prevention (GAP-024) ---------------------------------
+#
+# On POSIX, `_run_command`'s existing timeout-cleanup path (`os.killpg` +
+# `_find_descendant_pids`) only covers the case where THIS module's own code
+# is still running to execute that cleanup -- e.g. the tool-level timeout
+# firing, or a normal asyncio.CancelledError propagating through a still-
+# alive event loop. It does NOT cover the host `amplifier.exe` process being
+# killed outright (crash, `Stop-Process`/`taskkill /F` on just the top PID,
+# a supervisor terminating only the parent) -- Windows has no equivalent of
+# POSIX's parent-death signal (`prctl(PR_SET_PDEATHSIG)`), so a subprocess
+# spawned here has no way to notice its parent is gone and no code of ours
+# runs to clean it up.
+#
+# Confirmed empirically (adversarial Windows re-test, alienware-r13):
+# spawning `sleep 60` via this module's WSL-routed path
+# (`wsl --exec bash -c ...`), then killing ONLY the top-level `amplifier.exe`
+# PID (no /T, no console Ctrl+C -- a plain `Stop-Process -Id <pid>`), left
+# the resulting `wsl.exe -> wsl.exe -> wslhost.exe` chain running with a
+# dead parent for the entire 60+ second observation window. This directly
+# contradicts the prior claim that killing only the top-level PID always
+# brings the whole tree down within ~2s -- that was true for amplifier's own
+# internal python-to-python self-relaunch (which IS covered by an existing
+# job-object association), but not for tool-call subprocesses spawned from
+# deep inside a running turn, which were never assigned to that job.
+#
+# Fix: create one Windows Job Object per process, with
+# JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE set, and assign every subprocess this
+# module spawns (on the foreground/tracked path only -- NOT
+# `_run_command_background`, whose whole point is to outlive us) to that
+# job. The job's only handle lives in this process; when this process ends
+# for ANY reason -- including a forceful kill that runs none of our own
+# Python cleanup code -- the OS closes that handle and the kernel itself
+# tears down every process still assigned to the job. This does not depend
+# on any application code running, so it also covers crashes.
+_windows_job_handle = None
+# Created at import, not lazily. A `if _lock is None: _lock = Lock()` guard is
+# itself unsynchronised -- two OS threads can both see None and build two locks,
+# defeating the mutual exclusion it exists to provide. Nothing in this module
+# currently calls off the event-loop thread, so this was latent, but a
+# module-level construction costs nothing and removes the trap.
+_windows_job_lock = threading.Lock()
+
+# Background descendant-sweep tasks, held so the event loop cannot garbage
+# collect them mid-flight. asyncio.create_task returns a task that is only
+# weakly referenced by the loop; the docs are explicit that an unreferenced task
+# "may get garbage collected at any time, even before it's done". These sweeps
+# are the entire GAP-013/GAP-028 protection for WSL descendants, and if one
+# vanished the symptom would be indistinguishable from a silent assignment
+# failure.
+_windows_sweep_tasks: set = set()
+
+# One-shot flag so a job-object failure is reported loudly ONCE per process
+# rather than either spamming every command or (as before) being invisible.
+_windows_job_failure_reported = False
+
+
+def _report_windows_job_failure(message: str, *args) -> None:
+    """Report a job-object failure ONCE per process, at warning level.
+
+    These failures used to be logged at debug only and their return values
+    discarded by every caller, so the entire orphan-protection mechanism could
+    be inert with no operator-visible signal at all.
+
+    That matters most in exactly the environments this protection is for.
+    ``AssignProcessToJobObject`` fails when the process is already inside a job
+    that disallows the assignment -- the normal state under CI runners (GitHub
+    Actions wraps every step in a job object), Windows containers, and some
+    endpoint-security agents. In those environments this ships, every command
+    still "succeeds", and nothing anywhere indicates the protection never
+    engaged. A later orphan report would then be wrongly dismissed as
+    already-fixed.
+
+    Warning rather than error because the tool call itself is unaffected --
+    this is defense-in-depth, not a correctness requirement. Once per process
+    rather than per command because the cause is environmental and constant;
+    repeating it every command would be noise that trains people to ignore it.
+    """
+    global _windows_job_failure_reported
+    if _windows_job_failure_reported:
+        logger.debug("tool-bash: " + message, *args)
+        return
+    _windows_job_failure_reported = True
+    logger.warning(
+        "tool-bash: Windows orphan protection is NOT active for this process. "
+        + message
+        + ". Subprocesses spawned by this tool may survive an abrupt exit. "
+        "This is expected inside a restrictive parent job object (CI runners, "
+        "Windows containers); it is reported once per process.",
+        *args,
+    )
+
+
+def _get_windows_job_object():
+    """Lazily create (once per process) a Job Object with kill-on-close set.
+
+    Returns the job handle (an int, per ctypes' ``wintypes.HANDLE``) or
+    ``None`` if creation failed for any reason -- callers must treat that as
+    "no extra protection available" and continue without raising, since
+    this is a defense-in-depth addition, not a required dependency for the
+    tool to function.
+    """
+    global _windows_job_handle, _windows_job_lock
+    if sys.platform != "win32":
+        return None
+    if _windows_job_lock is None:
+        import threading
+
+        _windows_job_lock = threading.Lock()
+    with _windows_job_lock:
+        if _windows_job_handle is not None:
+            return _windows_job_handle
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+            # Declare signatures rather than letting ctypes default an
+            # undeclared return to c_int (32-bit signed), which truncates a
+            # 64-bit HANDLE. Win32 guarantees handle values are 32-bit
+            # significant, so the untyped form happens to work -- but relying on
+            # an unstated guarantee is how a silent, platform-specific
+            # corruption bug gets in.
+            kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+            kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+            kernel32.SetInformationJobObject.restype = wintypes.BOOL
+            kernel32.SetInformationJobObject.argtypes = [
+                wintypes.HANDLE,
+                ctypes.c_int,
+                wintypes.LPVOID,
+                wintypes.DWORD,
+            ]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+            job = kernel32.CreateJobObjectW(None, None)
+            if not job:
+                _report_windows_job_failure(
+                    "CreateJobObjectW failed (%s)",
+                    ctypes.WinError(ctypes.get_last_error()),
+                )
+                return None
+
+            # JOBOBJECT_BASIC_LIMIT_INFORMATION + JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+            # layout (winnt.h). We only need to set LimitFlags on the basic
+            # struct embedded at the start of the extended one.
+            JobObjectExtendedLimitInformation = 9
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+            class IO_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("ReadOperationCount", ctypes.c_uint64),
+                    ("WriteOperationCount", ctypes.c_uint64),
+                    ("OtherOperationCount", ctypes.c_uint64),
+                    ("ReadTransferCount", ctypes.c_uint64),
+                    ("WriteTransferCount", ctypes.c_uint64),
+                    ("OtherTransferCount", ctypes.c_uint64),
+                ]
+
+            class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD),
+                ]
+
+            class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                    ("IoInfo", IO_COUNTERS),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+
+            ok = kernel32.SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            )
+            if not ok:
+                _report_windows_job_failure(
+                    "SetInformationJobObject failed (%s)",
+                    ctypes.WinError(ctypes.get_last_error()),
+                )
+                kernel32.CloseHandle(job)
+                return None
+
+            _windows_job_handle = job
+            return job
+        except Exception as e:  # pragma: no cover - defense in depth only
+            logger.debug(
+                "tool-bash: Windows job-object setup failed (%s); "
+                "proceeding without orphan protection",
+                e,
+            )
+            return None
+
+
+def _assign_to_windows_job(pid: int) -> bool:
+    """Best-effort: assign `pid` to this process's kill-on-close job object.
+
+    Returns whether assignment actually succeeded. Most callers only need
+    "did I do my best" semantics and can ignore the return value; the
+    descendant-walker below (GAP-013/GAP-028) uses it to log clearly.
+
+    Failure is intentionally swallowed as far as the CALLER's control flow
+    goes (logged at debug only) -- this is defense-in-depth cleanup, not a
+    correctness requirement for the command itself to run. A process that
+    can't be assigned (e.g. already exited, or running with different
+    privileges) just doesn't get the extra protection; it does not fail
+    the tool call.
+    """
+    if sys.platform != "win32":
+        return False
+    job = _get_windows_job_object()
+    if job is None:
+        return False
+    try:
+        import ctypes
+
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        ]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [
+            wintypes.HANDLE,
+            wintypes.HANDLE,
+        ]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        PROCESS_ALL_ACCESS = 0x1F0FFF
+        hproc = kernel32.OpenProcess(PROCESS_ALL_ACCESS, False, pid)
+        if not hproc:
+            # Debug, not warning: the overwhelmingly common cause is that the
+            # process already exited between spawn and assignment, which is
+            # benign and expected for fast commands. Distinct from the
+            # environmental failures reported once at warning level.
+            logger.debug(
+                "tool-bash: OpenProcess(%s) failed (%s); pid not job-protected "
+                "(usually means it already exited)",
+                pid,
+                ctypes.WinError(ctypes.get_last_error()),
+            )
+            return False
+        try:
+            if not kernel32.AssignProcessToJobObject(job, hproc):
+                # This one IS environmental: the dominant cause is that this
+                # process already sits inside a job object that disallows the
+                # assignment -- the normal state under CI runners, Windows
+                # containers, and some endpoint-security agents. Report it
+                # loudly once, because in that case the protection is inert for
+                # every command and nothing else would ever say so.
+                _report_windows_job_failure(
+                    "AssignProcessToJobObject(pid=%s) failed (%s)",
+                    pid,
+                    ctypes.WinError(ctypes.get_last_error()),
+                )
+                return False
+            return True
+        finally:
+            kernel32.CloseHandle(hproc)
+    except Exception as e:  # pragma: no cover - defense in depth only
+        logger.debug("tool-bash: failed to job-protect pid %s (%s)", pid, e)
+        return False
+
+
+def _enumerate_child_pids_windows(parent_pid: int) -> set[int]:
+    """Direct children of `parent_pid` via CreateToolhelp32Snapshot -- a
+    plain Win32 API walk of the system-wide process snapshot, filtered by
+    th32ParentProcessID. No WMI/CIM, no PowerShell subprocess.
+
+    Windows-only. Returns an empty set on any failure or on other platforms.
+    """
+    if sys.platform != "win32":
+        return set()
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        TH32CS_SNAPPROCESS = 0x00000002
+        # CreateToolhelp32Snapshot signals failure by returning
+        # INVALID_HANDLE_VALUE, i.e. (HANDLE)-1 -- NOT NULL. With restype
+        # HANDLE (c_void_p), ctypes converts NULL to None and any other
+        # pointer value, including the -1 bit pattern, to a positive Python
+        # int (18446744073709551615 on 64-bit). Compare against the real
+        # sentinel, not the signed literal -1.
+        _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+        class PROCESSENTRY32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", ctypes.c_long),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", ctypes.c_char * 260),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # Same reasoning as the job-object signatures above: CreateToolhelp32Snapshot
+        # returns a HANDLE, and leaving restype undeclared truncates it to a 32-bit
+        # c_int on 64-bit Windows. Declare all four signatures explicitly.
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.Process32First.restype = wintypes.BOOL
+        kernel32.Process32First.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(PROCESSENTRY32),
+        ]
+        kernel32.Process32Next.restype = wintypes.BOOL
+        kernel32.Process32Next.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(PROCESSENTRY32),
+        ]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap is None or snap == _INVALID_HANDLE_VALUE:
+            return set()
+        try:
+            entry = PROCESSENTRY32()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+            children: set[int] = set()
+            if not kernel32.Process32First(snap, ctypes.byref(entry)):
+                return set()
+            while True:
+                if entry.th32ParentProcessID == parent_pid:
+                    children.add(entry.th32ProcessID)
+                if not kernel32.Process32Next(snap, ctypes.byref(entry)):
+                    break
+            return children
+        finally:
+            kernel32.CloseHandle(snap)
+    except Exception as e:  # pragma: no cover - defense in depth only
+        logger.debug(
+            "tool-bash: descendant enumeration failed for %s (%s)", parent_pid, e
+        )
+        return set()
+
+
+def _spawn_descendant_sweep(root_pid: int) -> None:
+    """Start the descendant sweep and KEEP A REFERENCE to the task.
+
+    ``asyncio.create_task`` returns a task the loop holds only weakly. The
+    stdlib docs are explicit: "Save a reference to the result of this
+    function... A task that isn't referenced elsewhere may get garbage
+    collected at any time, even before it's done."
+
+    These sweeps are the whole GAP-013/GAP-028 protection for WSL descendants
+    (inner ``wsl.exe``, ``wslhost.exe``), which do NOT inherit job membership
+    from the immediate spawned PID. If one were collected mid-flight, the
+    symptom would be orphaned processes with nothing in the logs -- outwardly
+    identical to a silent job-assignment failure, and correspondingly awful to
+    diagnose.
+
+    In practice the task is always parked on ``asyncio.sleep``, so the loop's
+    timer structures probably keep it reachable. "Probably" is not a property
+    worth betting a process-cleanup guarantee on, and a set costs nothing.
+    """
+    task = asyncio.create_task(_protect_windows_descendants(root_pid))
+    _windows_sweep_tasks.add(task)
+    task.add_done_callback(_windows_sweep_tasks.discard)
+
+
+async def _protect_windows_descendants(root_pid: int) -> None:
+    """Best-effort background task (GAP-013/GAP-028): assign every
+    descendant of `root_pid` to the same kill-on-close job object, not
+    just the immediate spawned PID.
+
+    Why this exists: `_assign_to_windows_job(process.pid)` alone was found
+    NOT to actually protect a WSL-routed command's real descendants.
+    Verified directly against the deployed code with the Win32
+    `IsProcessInJob` query (native Windows, alienware-r13): after spawning
+    `wsl --exec bash -c <cmd>` and calling `_assign_to_windows_job()` on
+    the immediate PID, that top-level PID *was* a job member -- but the
+    inner `wsl.exe` and `wslhost.exe` processes underneath it (the ones
+    that do the actual work, and the ones this module's own comments
+    elsewhere claim are covered) were NOT. Windows only auto-propagates
+    job membership to children spawned directly by a job-member process
+    via CreateProcess; WSL's inner process tree is connected to the outer
+    `wsl.exe` via an RPC/session channel rather than a plain parent-child
+    CreateProcess relationship, so it never inherits membership that way.
+
+    An external kill of the top-level process was still observed (same
+    investigation) to bring the whole WSL tree down in practice -- but via
+    WSL's own connection-teardown behavior when its client disconnects,
+    not via the job object. That is a real, currently-working mechanism,
+    but it is undocumented, owned by WSL rather than by us, and not
+    something this module actually controls or could adjust if it ever
+    changed. This function makes the protection deliberate instead of
+    coincidental: it walks the process tree (root_pid's children, and
+    their children) with a few short retries -- the WSL tree takes a
+    moment to fully spawn -- and assigns every PID it finds to the job
+    too, so the kill-on-close guarantee no longer depends on an external,
+    unverified assumption about WSL's behavior.
+
+    Fire-and-forget: runs concurrently with the command's own
+    process.communicate(), never blocks or delays the tool call, and
+    never raises (every failure path is caught and logged at debug only,
+    same contract as _assign_to_windows_job itself).
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        seen: set[int] = {root_pid}
+        for _ in range(8):  # poll for up to ~2s while the tree spawns
+            frontier = list(seen)
+            new_found = False
+            for pid in frontier:
+                for child in _enumerate_child_pids_windows(pid):
+                    if child not in seen:
+                        seen.add(child)
+                        _assign_to_windows_job(child)
+                        new_found = True
+            if not new_found and len(seen) > 1:
+                break  # tree grew at least once, then stopped changing
+            await asyncio.sleep(0.25)
+    except Exception as e:  # pragma: no cover - defense in depth only
+        logger.debug(
+            "tool-bash: descendant job-protection sweep failed for %s (%s)",
+            root_pid,
+            e,
+        )
+
+
+# --- Windows shell resolution: Git Bash discoverability + observability --
+#
+# Root cause (confirmed on a real Windows 11 box, Git for Windows 2.55.0.3
+# installed a month prior): Git for Windows' *default* install puts
+# `Git\cmd` on PATH (git.exe lives there) but NOT `Git\bin` (bash.exe lives
+# there). Meanwhile `C:\Windows\System32\bash.exe` -- the WSL launcher
+# stub -- is effectively always on PATH. The result: `shutil.which("bash")`
+# resolves the WSL launcher every time, and Git Bash is unreachable no
+# matter what's installed -- even though a `bash` call against a WSL box
+# reaches a different filesystem, HOME, and toolchain (e.g. the WSL Linux
+# Python, not the Windows Python the user actually has installed) than a
+# `bash` call against Git Bash.
+#
+# Fix: (1) probe the well-known Git-for-Windows install locations directly
+# on the filesystem, independent of PATH, so Git Bash becomes genuinely
+# discoverable; (2) make the choice between WSL and Git Bash explicit and
+# overridable via `windows_shell` config / the AMPLIFIER_BASH_WINDOWS_SHELL
+# env var, defaulting to "auto" -- which preserves today's real-world
+# default behavior exactly (PATH-first resolution, so WSL wins when both
+# are present, unchanged for existing users) and only engages the new
+# filesystem probing as a fallback when PATH resolves nothing at all
+# (previously a hard "bash not found" error even with Git Bash installed).
+
+_WINDOWS_SHELL_PREFERENCE_ENV_VAR = "AMPLIFIER_BASH_WINDOWS_SHELL"
+_VALID_WINDOWS_SHELL_PREFERENCES = ("auto", "wsl", "gitbash")
+
+
+def _find_git_bash_executable() -> str | None:
+    """Probe well-known Git-for-Windows install locations for bash.exe,
+    independent of PATH (see module-level note above for why PATH alone
+    can never find it on a box where WSL is also installed).
+
+    Returns the first that exists on disk, or None.
+    """
+    candidates: list[str] = []
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    for env_var in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(env_var)
+        if base:
+            candidates.append(os.path.join(base, "Git", "bin", "bash.exe"))
+    if local_app_data:
+        candidates.append(
+            os.path.join(local_app_data, "Programs", "Git", "bin", "bash.exe")
+        )
+    # bash.exe under Git\bin is normally a copy of the one under
+    # Git\usr\bin; some installs (or a damaged/partial one) may only have
+    # the latter, so check it too before giving up.
+    for env_var in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(env_var)
+        if base:
+            candidates.append(os.path.join(base, "Git", "usr", "bin", "bash.exe"))
+    if local_app_data:
+        candidates.append(
+            os.path.join(local_app_data, "Programs", "Git", "usr", "bin", "bash.exe")
+        )
+
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _find_wsl_bash_executable() -> str | None:
+    """Probe the well-known WSL launcher location directly, independent of
+    PATH. In practice PATH always resolves this one (System32 is on every
+    Windows PATH by construction) -- this exists mainly for symmetry with
+    `_find_git_bash_executable` and to serve explicit `windows_shell="wsl"`
+    requests robustly even in an unusual PATH configuration.
+    """
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    candidate = os.path.join(system_root, "System32", "bash.exe")
+    return candidate if os.path.isfile(candidate) else None
+
+
+def _looks_like_wsl_launcher_path(path: str | None) -> bool:
+    """Cheap, SYNCHRONOUS classification used only to build the tool
+    description / startup log line at construction time (see
+    `BashTool._windows_shell_startup_note`) -- NOT used to decide how a
+    command actually executes. That decision always goes through
+    `BashTool._is_wsl_bash`'s authoritative `test -d /mnt/wsl` subprocess
+    check. On a real Windows install, the WSL launcher only ever lives at
+    `%SystemRoot%\\System32\\bash.exe`, so a path-string check is a safe,
+    deterministic stand-in for the one place we can't afford to spawn a
+    process (a synchronous constructor).
+    """
+    return path is not None and "system32" in path.lower()
+
+
+def _arbitrate_windows_shell(
+    preference: str,
+    path_bash: str | None,
+    path_bash_is_wsl: bool,
+    git_bash_candidate: str | None,
+    wsl_bash_candidate: str | None,
+) -> tuple[str | None, bool]:
+    """Pure decision: given what PATH resolves and what's discoverable via
+    the well-known install-location probes, decide which bash executable
+    wins and whether it's WSL bash.
+
+    Shared by the authoritative async resolution
+    (`BashTool._resolve_windows_bash`, using a real subprocess check for
+    `path_bash_is_wsl`) and the synchronous, approximate one used for the
+    startup log/description (using the path heuristic above) -- so the
+    *decision* logic lives in exactly one place, even though *how
+    WSL-ness is determined* legitimately differs between the two callers.
+
+    "auto" (default) preserves today's real-world behavior exactly: if
+    PATH resolves anything, it wins outright, full stop -- unchanged for
+    every existing user. Only when PATH resolves NOTHING does auto fall
+    back to the install-location probes (a strict improvement: previously
+    a hard error even with Git Bash installed). Explicit "wsl"/"gitbash"
+    preferences consider both PATH and the probes, so a user can force
+    Git Bash even where PATH resolves WSL's launcher first (the reported
+    bug) -- or force WSL even where PATH would resolve Git Bash first.
+    """
+    if preference == "auto" and path_bash:
+        return path_bash, path_bash_is_wsl
+
+    gitbash_exe = (
+        path_bash if (path_bash and not path_bash_is_wsl) else git_bash_candidate
+    )
+    wsl_exe = path_bash if (path_bash and path_bash_is_wsl) else wsl_bash_candidate
+
+    if preference == "gitbash" and gitbash_exe:
+        return gitbash_exe, False
+    if preference == "wsl" and wsl_exe:
+        return wsl_exe, True
+
+    if preference != "auto":
+        logger.warning(
+            "tool-bash: windows_shell=%r requested but not available on "
+            "this machine; falling back to auto-detection",
+            preference,
+        )
+
+    if wsl_exe:
+        return wsl_exe, True
+    if gitbash_exe:
+        return gitbash_exe, False
+    return None, False
 
 
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
@@ -110,6 +748,11 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             - allowed_commands: Whitelist of allowed commands (default: [])
             - denied_commands: Additional custom blocklist patterns (default: [])
             - safety_overrides: Fine-grained safety overrides dict with 'allow' and 'block' lists
+            - windows_shell: Windows-only. Which bash to prefer: "auto" (default,
+              PATH-first -- unchanged from prior behavior), "wsl", or "gitbash".
+              Also settable via the AMPLIFIER_BASH_WINDOWS_SHELL env var
+              (config takes precedence). See _arbitrate_windows_shell for
+              the full resolution/fallback rules.
 
     Returns:
         Optional cleanup function
@@ -214,6 +857,110 @@ SAFETY:
 
         # Cache for WSL bash detection to avoid repeated checks
         self._wsl_bash_cache: dict[str, bool] = {}
+
+        # Windows shell resolution: which bash (WSL vs Git Bash) to use, and
+        # whether the choice has been explicitly overridden. See the
+        # module-level note above `_arbitrate_windows_shell` for why PATH
+        # alone can't be trusted to ever surface Git Bash.
+        self._windows_shell_preference = self._resolve_windows_shell_preference(config)
+        # Cache for the AUTHORITATIVE resolution (async, subprocess-verified
+        # is_wsl check) used to actually execute commands. Resolved once per
+        # instance, not per command -- shared by both the foreground
+        # (_run_command) and background (_run_command_background) paths so
+        # they can never disagree (see _resolve_windows_bash docstring).
+        self._windows_bash_resolved: tuple[str | None, bool] | None = None
+
+        # Windows only: append a startup note (log + tool description) naming
+        # the shell we expect to resolve to, so a user/model isn't left to
+        # discover it only after a confusing failure hundreds of calls in
+        # (e.g. `python script.py` failing because WSL bash can't see the
+        # Windows Python). Uses a synchronous, approximate classification
+        # (`_looks_like_wsl_launcher_path`) since the authoritative,
+        # subprocess-verified check can't run inside a sync constructor --
+        # the real execution routing is unaffected and always uses that
+        # authoritative check via `_resolve_windows_bash`.
+        if sys.platform == "win32":
+            self.description = self.description + self._windows_shell_startup_note()
+
+    @staticmethod
+    def _resolve_windows_shell_preference(config: dict[str, Any]) -> str:
+        """Resolve the explicit Windows shell preference: `windows_shell`
+        config key, then the AMPLIFIER_BASH_WINDOWS_SHELL env var, then
+        "auto" (today's default: PATH-first, unchanged).
+
+        This module has no existing config-resolution system to plug into
+        (checked: no env vars, no config layer beyond plain config.get(...)
+        calls) -- a plain env var + config key, in the spirit of the
+        existing code, is the whole mechanism.
+        """
+        value = config.get("windows_shell") or os.environ.get(
+            _WINDOWS_SHELL_PREFERENCE_ENV_VAR
+        )
+        if not value:
+            return "auto"
+        value = value.strip().lower()
+        if value not in _VALID_WINDOWS_SHELL_PREFERENCES:
+            logger.warning(
+                "tool-bash: unknown windows_shell=%r (expected one of %s); "
+                "using 'auto'",
+                value,
+                _VALID_WINDOWS_SHELL_PREFERENCES,
+            )
+            return "auto"
+        return value
+
+    def _windows_shell_startup_note(self) -> str:
+        """Build the Windows-only description/log note naming the shell we
+        expect to resolve to and its path conventions -- the model needs
+        this BEFORE its first command (WSL mounts Windows drives at
+        /mnt/c/..., Git Bash at /c/...; guessing wrong -- not a hard
+        error -- was found to be the dominant failure mode across
+        comparable CLI agents). Approximate (see
+        `_looks_like_wsl_launcher_path`); the actual command routing
+        always uses the authoritative, subprocess-verified check in
+        `_resolve_windows_bash`.
+        """
+        path_bash = shutil.which("bash")
+        path_bash_is_wsl = _looks_like_wsl_launcher_path(path_bash)
+        exe, is_wsl = _arbitrate_windows_shell(
+            self._windows_shell_preference,
+            path_bash,
+            path_bash_is_wsl,
+            _find_git_bash_executable(),
+            _find_wsl_bash_executable(),
+        )
+
+        logger.info(
+            "tool-bash: Windows shell (approx; confirmed on first command) -> %s (%s)",
+            exe or "NOT FOUND",
+            "wsl" if is_wsl else ("gitbash" if exe else "none"),
+        )
+
+        override_hint = (
+            "\n(Override: set windows_shell config or "
+            f"{_WINDOWS_SHELL_PREFERENCE_ENV_VAR} env var to 'wsl' or "
+            "'gitbash'.)"
+        )
+        if exe is None:
+            return (
+                "\n\nWINDOWS SHELL: no bash found (WSL or Git Bash). Every "
+                "command will fail with an actionable error naming how to "
+                "install one."
+            )
+        if is_wsl:
+            return (
+                f"\n\nWINDOWS SHELL: WSL bash ({exe}). Windows drives are "
+                "mounted at /mnt/c/..., not /c/...; $HOME is the WSL "
+                "Linux home, not the Windows user profile; the toolchain "
+                "(e.g. python) is whatever is installed INSIDE that Linux "
+                "distro, not on Windows." + override_hint
+            )
+        return (
+            f"\n\nWINDOWS SHELL: Git Bash ({exe}). Windows drives are "
+            "mounted at /c/..., not /mnt/c/...; $HOME is the Windows user "
+            "profile; the toolchain (e.g. python) is whatever is "
+            "installed on Windows itself." + override_hint
+        )
 
     @property
     def input_schema(self) -> dict:
@@ -528,6 +1275,45 @@ SAFETY:
             self._wsl_bash_cache[bash_exe] = False
             return False
 
+    async def _resolve_windows_bash(self) -> tuple[str | None, bool]:
+        """Authoritative Windows shell resolution: which bash executable to
+        use, and whether it's WSL bash. Resolved ONCE per instance and
+        cached -- both `_run_command` and `_run_command_background` call
+        this (instead of each rolling their own PATH lookup / cache read)
+        so the two paths can never disagree about which shell is active.
+
+        Previously `_run_command_background` read
+        `self._wsl_bash_cache.get(bash_exe, False)` directly, defaulting to
+        False -- so a background command issued before any foreground
+        command routed WSL's bash.exe down the Git-Bash direct-exec
+        branch, bypassing the `wsl --exec` wrapper that exists
+        specifically to prevent premature variable expansion. Since this
+        method is itself async, both call sites can simply await it
+        instead.
+        """
+        if self._windows_bash_resolved is not None:
+            return self._windows_bash_resolved
+
+        path_bash = shutil.which("bash")
+        path_bash_is_wsl = await self._is_wsl_bash(path_bash) if path_bash else False
+
+        resolved = _arbitrate_windows_shell(
+            self._windows_shell_preference,
+            path_bash,
+            path_bash_is_wsl,
+            _find_git_bash_executable(),
+            _find_wsl_bash_executable(),
+        )
+        self._windows_bash_resolved = resolved
+
+        exe, is_wsl = resolved
+        logger.info(
+            "tool-bash: Windows shell resolved -> %s (%s)",
+            exe or "NOT FOUND",
+            "wsl" if is_wsl else ("gitbash" if exe else "none"),
+        )
+        return resolved
+
     async def _run_command_background(self, command: str) -> dict[str, Any]:
         """Run command in background, returning immediately with PID.
 
@@ -547,14 +1333,14 @@ SAFETY:
         devnull = subprocess.DEVNULL
 
         if is_windows:
-            # Windows background execution
-            bash_exe = shutil.which("bash")
+            # Windows background execution. Resolution is authoritative and
+            # shared with the foreground path via `_resolve_windows_bash`
+            # (this method is itself async, so it can simply await it) --
+            # see that method's docstring for why the previous
+            # `self._wsl_bash_cache.get(bash_exe, False)` read here could
+            # silently disagree with the foreground path.
+            bash_exe, is_wsl = await self._resolve_windows_bash()
             if bash_exe:
-                # Determine if WSL bash (requires special invocation)
-                # Note: We need to run detection synchronously here since Popen is sync
-                # Use cached result if available, otherwise assume not WSL for background
-                is_wsl = self._wsl_bash_cache.get(bash_exe, False)
-
                 if is_wsl:
                     # WSL bash: Use 'wsl --exec bash -c' to prevent premature variable expansion
                     process = subprocess.Popen(
@@ -614,7 +1400,10 @@ SAFETY:
 
         On Unix-like systems (Linux, macOS, WSL), uses bash for full shell features.
         On Windows, attempts to find bash (Git Bash or WSL bash).
-        Falls back to cmd.exe with limitations if bash is not found.
+        If bash is not found, every command fails with an actionable error
+        naming the cause and how to install bash (Git for Windows or WSL) --
+        this tool's contract is POSIX shell semantics, so there is no
+        partial/degraded fallback (e.g. cmd.exe) for "simple" commands.
 
         Uses process groups for proper cleanup on timeout - kills entire process tree.
         """
@@ -624,15 +1413,14 @@ SAFETY:
         pgid = None
 
         if is_windows:
-            # Try to find bash (Git Bash or WSL bash)
-            bash_exe = shutil.which("bash")
+            # Resolve which bash to use (Git Bash or WSL bash) -- shared,
+            # cached-once resolution; see `_resolve_windows_bash` docstring.
+            bash_exe, is_wsl = await self._resolve_windows_bash()
 
             if bash_exe:
                 # Bash found on Windows - use create_subprocess_exec to handle
                 # paths with spaces (e.g., "C:\Program Files\Git\bin\bash.exe")
                 # and properly handle WSL bash variable expansion
-                is_wsl = await self._is_wsl_bash(bash_exe)
-
                 if is_wsl:
                     # WSL bash: Use 'wsl --exec bash -c' to prevent premature
                     # variable expansion by the WSL launcher
@@ -647,6 +1435,17 @@ SAFETY:
                         stdin=asyncio.subprocess.DEVNULL,  # Never hand the child our stdin
                         cwd=self.working_dir,
                     )
+                    # GAP-024: assign to a kill-on-close job object so this
+                    # (and its wslhost.exe descendants) can't outlive an
+                    # amplifier.exe that gets killed outright rather than
+                    # cancelled through our own code. See helper docstring.
+                    _assign_to_windows_job(process.pid)
+                    # GAP-013/GAP-028: the immediate wsl.exe PID being a job
+                    # member does NOT mean its real descendants (inner
+                    # wsl.exe, wslhost.exe) are -- verified directly with
+                    # IsProcessInJob. Sweep for them in the background; see
+                    # _protect_windows_descendants docstring for why.
+                    _spawn_descendant_sweep(process.pid)
                 else:
                     # Git Bash or other: Direct exec with [bash, -c, command]
                     process = await asyncio.create_subprocess_exec(
@@ -658,39 +1457,45 @@ SAFETY:
                         stdin=asyncio.subprocess.DEVNULL,  # Never hand the child our stdin
                         cwd=self.working_dir,
                     )
+                    _assign_to_windows_job(process.pid)  # GAP-024, see above
+                    _spawn_descendant_sweep(process.pid)
             else:
-                # No bash found - fall back to limited cmd.exe behavior
-                # Check for shell features that won't work in cmd.exe
-                shell_features = ["|", "&&", "||", "~", ">", "<", "2>&1", "$(", "`"]
-                if any(feature in command for feature in shell_features):
-                    return {
-                        "stdout": "",
-                        "stderr": (
-                            "Bash not found in PATH.\n"
-                            "\n"
-                            "Shell features like |, &&, ||, ~, redirects require bash.\n"
-                            "\n"
-                            "Install Git for Windows (includes Git Bash):\n"
-                            "  https://git-scm.com/download/win\n"
-                            "\n"
-                            "Or install WSL:\n"
-                            "  https://learn.microsoft.com/en-us/windows/wsl/install"
-                        ),
-                        "returncode": 1,
-                    }
-
-                # Windows: Use direct execution (no shell) for simple commands
-                try:
-                    args = shlex.split(command)
-                except ValueError as e:
-                    raise ValueError(f"Invalid command syntax: {e}")
-
-                process = await asyncio.create_subprocess_exec(
-                    *args,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=self.working_dir,
-                )
+                # No bash found on Windows. This tool's entire contract is
+                # POSIX shell semantics (quoting, tilde expansion, &&/||/|,
+                # redirects, command substitution) -- there is no cmd.exe
+                # fallback, and there never should be a *partial* one.
+                # Previously, only commands containing an obvious shell
+                # metacharacter got this actionable error; anything else
+                # (`echo hello`, `ls`, `dir`, cmd.exe builtins like `cd`,
+                # `type`, `set`, `copy`, ...) fell through to
+                # shlex.split() + exec-with-no-shell-at-all and failed with
+                # a bare `[WinError 2] The system cannot find the file
+                # specified` -- naming neither the cause nor the fix. A
+                # tool named `bash` silently running some commands with no
+                # shell (or, worse, through cmd.exe) is a degraded state
+                # pretending to be a working one: the user's mental model
+                # breaks the moment quoting or a builtin behaves
+                # differently, with no signal why. Fail loud, unconditionally,
+                # for every command, with the real cause and the fix.
+                return {
+                    "stdout": "",
+                    "stderr": (
+                        "Bash not found in PATH.\n"
+                        "\n"
+                        "This tool requires bash for POSIX shell semantics "
+                        "(quoting, tilde expansion, pipes, redirects, "
+                        "command substitution). Without it, even simple "
+                        "commands cannot be run with correct, predictable "
+                        "behavior.\n"
+                        "\n"
+                        "Install Git for Windows (includes Git Bash):\n"
+                        "  https://git-scm.com/download/win\n"
+                        "\n"
+                        "Or install WSL:\n"
+                        "  https://learn.microsoft.com/en-us/windows/wsl/install"
+                    ),
+                    "returncode": 1,
+                }
         else:
             # Unix-like (Linux, macOS, WSL): Use real bash shell
             # This enables:
