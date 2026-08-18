@@ -1193,15 +1193,6 @@ SAFETY:
             if run_in_background:
                 # Execute command in background and return immediately
                 result = await self._run_command_background(command)
-                if "error" in result:
-                    # No bash on Windows: nothing was launched (no PID),
-                    # surface the same actionable error the foreground
-                    # path returns instead of a misleading success.
-                    return ToolResult(
-                        success=False,
-                        output=result["error"],
-                        error={"message": result["error"]},
-                    )
                 return ToolResult(
                     success=True,
                     output={
@@ -1529,7 +1520,15 @@ SAFETY:
                 # is a degraded state pretending to be a working one.
                 # Surface the same actionable error instead of
                 # attempting to run anything.
-                return {"pid": None, "error": _WINDOWS_NO_BASH_ERROR}
+                #
+                # Raising (rather than returning a sentinel) keeps the
+                # return contract of this method a plain `{"pid": ...}`
+                # with no optional keys for callers to remember to
+                # check. `execute()` already wraps this call and turns
+                # any exception into ToolResult(success=False,
+                # output=str(e), error={"message": str(e)}) -- exactly
+                # the shape the foreground path returns.
+                raise RuntimeError(_WINDOWS_NO_BASH_ERROR)
         else:
             # Unix-like: Use start_new_session to create new session, fully detached
             process = subprocess.Popen(

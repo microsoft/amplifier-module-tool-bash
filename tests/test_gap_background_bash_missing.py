@@ -56,7 +56,16 @@ async def test_background_real_exe_command_does_not_launch_when_bash_missing() -
     """
     tool = BashTool({})
 
-    popen_spy = AsyncMock()
+    # `subprocess.Popen` is synchronous -- spy with MagicMock, not
+    # AsyncMock. An AsyncMock returns a coroutine, so the pre-fix code
+    # would die on `process.pid` instead of producing the misleading
+    # success this test exists to guard against. Returning a usable
+    # fake process is what lets the pre-fix path reach `success=True`
+    # with a PID -- i.e. actually reproduce the regression.
+    class _FakeProcess:
+        pid = 1234
+
+    popen_spy = MagicMock(return_value=_FakeProcess())
 
     with (
         patch("amplifier_module_tool_bash.sys.platform", "win32"),
@@ -68,6 +77,17 @@ async def test_background_real_exe_command_does_not_launch_when_bash_missing() -
             "amplifier_module_tool_bash._find_wsl_bash_executable", return_value=None
         ),
         patch("amplifier_module_tool_bash.subprocess.Popen", popen_spy),
+        # Windows-only constants absent from `subprocess` on Linux/macOS.
+        # Without these, the PRE-FIX code raises AttributeError while
+        # evaluating `creationflags=` -- BEFORE Popen is ever reached --
+        # so `assert not popen_spy.called` below would pass against the
+        # broken code for entirely the wrong reason, and the
+        # misleading-success regression would never be exercised at all.
+        # Supplying them makes this test model real Windows.
+        patch.object(mod.subprocess, "DETACHED_PROCESS", 0x00000008, create=True),
+        patch.object(
+            mod.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
+        ),
     ):
         result = await tool.execute(
             {"command": "python --version", "run_in_background": True}
@@ -99,7 +119,11 @@ async def test_background_plain_command_gets_actionable_error_when_bash_missing(
     """
     tool = BashTool({})
 
-    popen_spy = AsyncMock()
+    # Synchronous spy -- see the note in the test above.
+    class _FakeProcess:
+        pid = 1234
+
+    popen_spy = MagicMock(return_value=_FakeProcess())
 
     with (
         patch("amplifier_module_tool_bash.sys.platform", "win32"),
@@ -111,6 +135,14 @@ async def test_background_plain_command_gets_actionable_error_when_bash_missing(
             "amplifier_module_tool_bash._find_wsl_bash_executable", return_value=None
         ),
         patch("amplifier_module_tool_bash.subprocess.Popen", popen_spy),
+        # See the note in the test above: without these Windows-only
+        # constants the pre-fix code dies on AttributeError before
+        # reaching Popen, so this test would not exercise the real
+        # bare-WinError regression it is written to guard.
+        patch.object(mod.subprocess, "DETACHED_PROCESS", 0x00000008, create=True),
+        patch.object(
+            mod.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
+        ),
     ):
         result = await tool.execute(
             {"command": "echo hello", "run_in_background": True}
