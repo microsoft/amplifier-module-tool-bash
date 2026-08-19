@@ -953,6 +953,46 @@ SAFETY:
     # Default output limit: ~100KB (roughly 25k tokens)
     DEFAULT_MAX_OUTPUT_BYTES = 100_000
 
+    # Binary output detection.
+    #
+    # Binary output costs tens of thousands of tokens of noise the model
+    # cannot use. Per-call truncation bounds one call but not a session, so
+    # binary streams are withheld entirely rather than truncated.
+    #
+    # Detection runs on the RAW BYTES, in two stages:
+    #
+    # 1. If the bytes decode as strict UTF-8, the stream is text. This covers
+    #    ASCII, UTF-8 (accents, CJK, emoji), and -- importantly -- the NUL
+    #    delimiter idioms `find -print0`, `grep -z` and `xargs -0`, since NUL
+    #    is valid UTF-8. Keying off NUL the way tool-web does would break the
+    #    standard safe-filename idiom; in shell output NUL is a delimiter,
+    #    not a binary marker.
+    #
+    # 2. Otherwise the stream is not UTF-8, which means either binary or text
+    #    in a legacy 8-bit encoding. These are separated by the proportion of
+    #    C0/C1 control bytes, which are pervasive in binary and essentially
+    #    absent from text of any encoding.
+    #
+    # Do NOT re-key this on the U+FFFD ratio of the DECODED string. That was
+    # measured and rejected: it is inverted on both sides. Real executables
+    # are full of ASCII string tables and NUL padding that decode cleanly
+    # (/bin/cat 3.6%, python3 2.3%), so they slip past; while legitimate text
+    # in legacy encodings is high-bit on nearly every character (cp1251
+    # Russian 80.9%, shift_jis Japanese 64.8%), so it gets destroyed. On the
+    # control-byte measure the two populations separate cleanly: every real
+    # binary tested scored >= 6.0%, every text sample scored 0.0%.
+    BINARY_CONTROL_BYTE_RATIO = 0.05
+
+    # C0/C1 control bytes excluding tab (0x09), LF (0x0A) and CR (0x0D),
+    # which are legitimate in text.
+    _BINARY_CONTROL_BYTES = frozenset(
+        set(range(0x09)) | {0x0B, 0x0C} | set(range(0x0E, 0x20)) | {0x7F}
+    )
+
+    # Below this many bytes the ratio is too noisy to be meaningful -- a short
+    # stream containing one control byte would otherwise trip the guard.
+    MIN_BINARY_SAMPLE_BYTES = 64
+
     def __init__(self, config: dict[str, Any]):
         """
         Initialize bash tool.
@@ -1205,13 +1245,27 @@ SAFETY:
                 # Execute command and wait for completion
                 result = await self._run_command(command, timeout=timeout)
 
+                # Decode, withholding binary BEFORE truncating. Truncation
+                # bounds a single call but not a session: a binary payload
+                # still costs tens of thousands of tokens of noise per call
+                # after truncation, so a few dozen such calls exhaust even a
+                # 1M-token context.
+                stdout, stdout_binary = self._guard_binary_output(
+                    result["stdout_raw"], stream="stdout"
+                )
+                stderr, stderr_binary = self._guard_binary_output(
+                    result["stderr_raw"], stream="stderr"
+                )
+
+                # True sizes as produced by the subprocess. Taken before
+                # truncation and independently of decoding, so a lossy decode
+                # (U+FFFD is 3 bytes for a 1-byte input) cannot inflate them.
+                stdout_bytes = len(result["stdout_raw"])
+                stderr_bytes = len(result["stderr_raw"])
+
                 # Apply output truncation to prevent context overflow
-                stdout, stdout_truncated, stdout_bytes = self._truncate_output(
-                    result["stdout"]
-                )
-                stderr, stderr_truncated, stderr_bytes = self._truncate_output(
-                    result["stderr"]
-                )
+                stdout, stdout_truncated, _ = self._truncate_output(stdout)
+                stderr, stderr_truncated, _ = self._truncate_output(stderr)
 
                 output = {
                     "stdout": stdout,
@@ -1226,6 +1280,10 @@ SAFETY:
                         output["stdout_total_bytes"] = stdout_bytes
                     if stderr_truncated:
                         output["stderr_total_bytes"] = stderr_bytes
+
+                # Include binary metadata if either stream was withheld
+                if stdout_binary or stderr_binary:
+                    output["binary_output_withheld"] = True
 
                 return ToolResult(
                     success=result["returncode"] == 0,
@@ -1307,6 +1365,42 @@ SAFETY:
 
         # Fallback: decode with error replacement (shouldn't normally happen)
         return truncated_bytes.decode("utf-8", errors="ignore")
+
+    def _guard_binary_output(self, raw: bytes, stream: str) -> tuple[str, bool]:
+        """Decode subprocess output, withholding it if it is binary.
+
+        Detection runs on the raw bytes, never on the decoded string (see
+        BINARY_CONTROL_BYTE_RATIO for why the decoded-string measure was
+        measured and rejected).
+
+        Text -- in any encoding -- is returned decoded with errors="replace",
+        matching prior behaviour. Binary is replaced with a short placeholder,
+        because returning it (even truncated) spends tens of thousands of
+        tokens on noise the model cannot use.
+
+        Returns:
+            Tuple of (decoded output or placeholder, was_withheld)
+        """
+        try:
+            return raw.decode("utf-8"), False
+        except UnicodeDecodeError:
+            pass
+
+        if len(raw) < self.MIN_BINARY_SAMPLE_BYTES:
+            return raw.decode("utf-8", errors="replace"), False
+
+        control_bytes = sum(1 for b in raw if b in self._BINARY_CONTROL_BYTES)
+        control_ratio = control_bytes / len(raw)
+        if control_ratio < self.BINARY_CONTROL_BYTE_RATIO:
+            return raw.decode("utf-8", errors="replace"), False
+
+        placeholder = (
+            f"[binary output withheld: {stream} contained {len(raw)} bytes "
+            f"of non-text data ({control_ratio:.0%} control bytes). "
+            f"Redirect to a file and inspect it with a suitable tool, "
+            f"e.g. `command > out.bin` then `file out.bin` or `xxd out.bin | head`.]"
+        )
+        return placeholder, True
 
     def _truncate_output(self, output: str) -> tuple[str, bool, int]:
         """Truncate output if it exceeds max_output_bytes.
@@ -1673,9 +1767,17 @@ SAFETY:
                 process.communicate(), timeout=effective_timeout
             )
 
+            # The decoded strings remain the contract for existing callers.
+            # The raw bytes are carried alongside because binary detection
+            # must run on the bytes, not on a lossy decode of them (see
+            # `_guard_binary_output`), and because the true byte count is
+            # needed for size reporting -- a lossy decode inflates it, since
+            # U+FFFD re-encodes to 3 bytes for what was a 1-byte input.
             return {
                 "stdout": stdout.decode("utf-8", errors="replace"),
                 "stderr": stderr.decode("utf-8", errors="replace"),
+                "stdout_raw": stdout,
+                "stderr_raw": stderr,
                 "returncode": process.returncode,
             }
 

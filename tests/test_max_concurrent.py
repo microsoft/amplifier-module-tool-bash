@@ -60,7 +60,13 @@ class TestMaxConcurrentEnforcement:
         tool = BashTool({"max_concurrent": 1, "safety_profile": "unrestricted"})
 
         with patch.object(tool, "_run_command", new_callable=AsyncMock) as mock_run:
-            mock_run.return_value = {"stdout": "hello", "stderr": "", "returncode": 0}
+            mock_run.return_value = {
+                "stdout": "hello",
+                "stderr": "",
+                "stdout_raw": b"hello",
+                "stderr_raw": b"",
+                "returncode": 0,
+            }
 
             result1 = await tool.execute({"command": "echo hello"})
             result2 = await tool.execute({"command": "echo hello"})
@@ -107,7 +113,13 @@ class TestMaxConcurrentEnforcement:
         tool._active_commands = 999
 
         with patch.object(tool, "_run_command", new_callable=AsyncMock) as mock_run:
-            mock_run.return_value = {"stdout": "hello", "stderr": "", "returncode": 0}
+            mock_run.return_value = {
+                "stdout": "hello",
+                "stderr": "",
+                "stdout_raw": b"hello",
+                "stderr_raw": b"",
+                "returncode": 0,
+            }
 
             result = await tool.execute({"command": "echo test"})
 
