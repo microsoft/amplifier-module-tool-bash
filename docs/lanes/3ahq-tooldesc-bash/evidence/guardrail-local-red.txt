@@ -29,7 +29,7 @@ E         + Low-level shell command execution. This is a fallback primitive - be
 E         
 E         ...Full output truncated (46 lines hidden), use '-vv' to show
 
-tests/test_lean_head_guardrail.py:124: AssertionError
+tests/test_lean_head_guardrail.py:136: AssertionError
 _____________________ test_description_within_char_budget ______________________
 
     def test_description_within_char_budget():
@@ -44,7 +44,7 @@ _____________________ test_description_within_char_budget ______________________
 E       AssertionError: BashTool.description is 1997 chars; the pinned budget is 1318. Stock was 1,997 chars before the lean-head change (679 saved). Every character here is paid on every request of every session, used or not.
 E       assert 1997 == 1318
 
-tests/test_lean_head_guardrail.py:139: AssertionError
+tests/test_lean_head_guardrail.py:151: AssertionError
 =========================== short test summary info ============================
 FAILED tests/test_lean_head_guardrail.py::test_description_is_byte_identical_to_v1
 FAILED tests/test_lean_head_guardrail.py::test_description_within_char_budget

@@ -29,6 +29,17 @@ regression:
 The vendored fixture is itself sha256-pinned, so "make the test pass by editing
 the fixture" is not a silent path -- it fails here first.
 
+LINE ENDINGS
+------------
+The fixture is a byte-exact artifact, so `.gitattributes` marks it `-text`: git
+must never newline-convert it on checkout. That alone is not enough to rely on
+-- a stale clone, a zip export or a `core.autocrlf` setting can still hand us
+CRLF -- so the sha256 below is taken over the file's TEXT (read with universal
+newlines, which is exactly the string compared against the description), not
+its raw bytes. One number then means the same thing on every platform, and it
+is simultaneously the sha256 of the shipped description. The first CI run of
+this guardrail failed on all three Windows legs for precisely this reason.
+
 WINDOWS NOTE
 ------------
 On Windows the *instance* appends a shell-resolution startup note to
@@ -51,8 +62,9 @@ from amplifier_module_tool_bash import BashTool
 
 VENDORED_PATH = Path(__file__).parent / "data" / "v1_bash_description.txt"
 
-# sha256 of the vendored file's bytes. Pinned so the fixture cannot be quietly
-# rewritten to match a description that has drifted.
+# sha256 of the vendored file's TEXT, utf-8 encoded (see LINE ENDINGS above).
+# Pinned so the fixture cannot be quietly rewritten to match a description that
+# has drifted. This is also the sha256 of the shipped description.
 VENDORED_SHA256 = "75f3577ad0cb859918b8360b13c3ff3bfaa1270e0a604495a21a0da491083cba"
 
 # Per-artifact budget. Stock was 1,997 chars; lean is 1,318 (679 saved).
@@ -104,7 +116,7 @@ def _vendored_text() -> str:
 def test_vendored_slice_is_intact():
     """The fixture itself is pinned, so it cannot absorb a drift."""
     assert VENDORED_PATH.exists(), f"vendored v1 slice missing at {VENDORED_PATH}"
-    digest = hashlib.sha256(VENDORED_PATH.read_bytes()).hexdigest()
+    digest = hashlib.sha256(_vendored_text().encode("utf-8")).hexdigest()
     assert digest == VENDORED_SHA256, (
         "tests/data/v1_bash_description.txt has been modified.\n"
         f"  expected sha256: {VENDORED_SHA256}\n"
