@@ -1,0 +1,51 @@
+.FF.........................                                             [100%]
+=================================== FAILURES ===================================
+___________________ test_description_is_byte_identical_to_v1 ___________________
+
+    def test_description_is_byte_identical_to_v1():
+        """`BashTool.description` is byte-for-byte the v1 lean text."""
+        expected = _vendored_text()
+        actual = BashTool.description
+>       assert actual == expected, (
+            "BashTool.description has drifted from the pinned v1 lean text.\n"
+            f"  expected {len(expected)} chars, sha256 "
+            f"{hashlib.sha256(expected.encode()).hexdigest()}\n"
+            f"  actual   {len(actual)} chars, sha256 "
+            f"{hashlib.sha256(actual.encode()).hexdigest()}\n"
+            "This text is billed on every request of every session. If the change "
+            "is intended, update tests/data/v1_bash_description.txt AND its sha256 "
+            "pin above, and state the new char count in the PR body."
+        )
+E       AssertionError: BashTool.description has drifted from the pinned v1 lean text.
+E           expected 1318 chars, sha256 75f3577ad0cb859918b8360b13c3ff3bfaa1270e0a604495a21a0da491083cba
+E           actual   1997 chars, sha256 bef1806dd8ba5ae651d34bf20ef7a507ae09c44d2c51d33dfbc7aed91027b359
+E         This text is billed on every request of every session. If the change is intended, update tests/data/v1_bash_description.txt AND its sha256 pin above, and state the new char count in the PR body.
+E       assert '\nLow-level ...             ' == 'Low-level sh...o && cd foo).'
+E         
+E         - Low-level shell execution, a fallback primitive: prefer a specialized capability when one exists (better error handling, structured output, safety guardrails); bash returns raw text with no retry logic.
+E           
+E         - Use for: builds and tests (pytest, npm test, cargo build, make), package management (pip, npm, cargo, brew), version control (git status, git diff, git commit), containers (docker, podman, kubectl), GitHub CLI (gh pr create, gh issue list), and system utilities when no specialized option exists.
+E         + Low-level shell command execution. This is a fallback primitive - befo...
+E         
+E         ...Full output truncated (46 lines hidden), use '-vv' to show
+
+tests/test_lean_head_guardrail.py:136: AssertionError
+_____________________ test_description_within_char_budget ______________________
+
+    def test_description_within_char_budget():
+        """Per-artifact char budget -- the thing actually being bought."""
+        actual = len(BashTool.description)
+>       assert actual == CHAR_BUDGET, (
+            f"BashTool.description is {actual} chars; the pinned budget is "
+            f"{CHAR_BUDGET}. Stock was 1,997 chars before the lean-head change "
+            f"(679 saved). Every character here is paid on every request of every "
+            f"session, used or not."
+        )
+E       AssertionError: BashTool.description is 1997 chars; the pinned budget is 1318. Stock was 1,997 chars before the lean-head change (679 saved). Every character here is paid on every request of every session, used or not.
+E       assert 1997 == 1318
+
+tests/test_lean_head_guardrail.py:151: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_lean_head_guardrail.py::test_description_is_byte_identical_to_v1
+FAILED tests/test_lean_head_guardrail.py::test_description_within_char_budget
+2 failed, 26 passed in 0.02s

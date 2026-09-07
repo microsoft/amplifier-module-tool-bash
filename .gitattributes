@@ -1,0 +1,6 @@
+# The lean-head guardrail pins tests/data/v1_bash_description.txt byte-for-byte
+# against the shipped tool description (see tests/test_lean_head_guardrail.py).
+# It is an exact artifact, not prose: git must never newline-convert it on
+# checkout, or the pin fails on Windows for a reason that has nothing to do
+# with the description.
+tests/data/v1_bash_description.txt -text
