@@ -282,3 +282,37 @@ trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.
+
+### Optional operation observer capability
+
+A host can register `operations.observe` on the coordinator as a local callable
+accepting one JSON-compatible event. The mounted tool looks it up when a managed
+process starts; no app imports, URL destinations, credentials, or agent-supplied
+callbacks are involved. Hosts bind their real session identity outside the event
+and must not trust a tool-supplied owner ID for authorization.
+
+Events use `schemaVersion: 1`, stable `operationId` (the process handle),
+`ownerId` (the mounted registry), monotonic `sequence`, `eventId`, `source:
+"tool-bash"`, `kind: "process"`, and timestamp `at`. Phases are `started`,
+`output` (one bounded `chunk` with its output cursor), `state` (for example
+cancellation requested), and `finished` (observed terminal `status`). Commands
+and stdin are not copied into the observation stream. Output is already subject
+to the normal binary guard and can contain sensitive command results; the host
+owns private storage and presentation policy.
+
+Each process has a bounded 32-event mailbox. Subprocess readers never await the
+observer. Async observer calls have a 500 ms deadline; synchronous observers must
+be cheap and nonblocking. Output can be dropped under backpressure or observer
+failure: source sequence/cursor gaps and `observerDroppedEvents` make that loss
+explicit. Failed events are never retried. Start waits for the initial bounded
+observation attempt; cleanup drains remaining observations before returning.
+`observer_available` and `observer_dropped_events` in normal process status
+report whether an observer was present and whether delivery failed. Observer
+availability is not a guarantee of durable storage.
+
+A durable host must deduplicate events, record missing evidence, preserve actual
+terminal results, and mark active receipts outcome unknown after losing their
+owner. The module's local output ring can expire independently of a host's
+archive. `output_complete` on process status means streams were drained, not
+that either archive retains every byte. The observer's task and callbacks end
+with the owned process; no observation or execution is restarted automatically.

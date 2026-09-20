@@ -52,6 +52,7 @@ class ProcessRecord:
     write_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     supervisor: asyncio.Task | None = None
     cleanup: asyncio.Task | None = None
+    events: Any = None
 
 
 class ManagedProcesses:
@@ -62,6 +63,7 @@ class ManagedProcesses:
         self.owner_id = uuid.uuid4().hex
         self.records: dict[str, ProcessRecord] = {}
         self.closed = False
+        self.observer = lambda: None
         self.lifecycle_lock = asyncio.Lock()
         self.output_limit = integer(
             tool.config.get("managed_max_output_bytes", 100_000),
@@ -277,6 +279,11 @@ class ManagedProcesses:
             self.tool._active_commands -= 1
             raise
         record = ProcessRecord(uuid.uuid4().hex, process, timeout)
+        observer = self.observer()
+        if callable(observer):
+            from .process_events import ProcessEvents
+
+            record.events = ProcessEvents(observer, record.process_id, self.owner_id)
         self.records[record.process_id] = record
         record.supervisor = asyncio.create_task(self.supervise(record))
         if cancelled or self.closed:
@@ -284,6 +291,12 @@ class ManagedProcesses:
             if cancelled:
                 raise asyncio.CancelledError()
             raise ValueError("Owning session closed while starting the process")
+        if record.events:
+            try:
+                await asyncio.shield(record.events.ready)
+            except asyncio.CancelledError:
+                await self.terminate(record, "cancel")
+                raise
         return self.read(record, 0, 16384)
 
     async def drain(self, record: ProcessRecord, stream: str) -> None:
@@ -316,6 +329,8 @@ class ManagedProcesses:
             }
         )
         record.cursor += 1
+        if record.events:
+            record.events.output(record.chunks[-1])
         record.retained_bytes += size
         record.total_bytes += size
         # Also bound object overhead for processes that emit one byte at a time.
@@ -332,6 +347,8 @@ class ManagedProcesses:
         ]
         waiter = asyncio.create_task(record.process.wait())
         try:
+            if record.events:
+                await record.events.state(self.status(record))
             try:
                 await asyncio.wait_for(asyncio.shield(waiter), record.timeout)
             except TimeoutError:
@@ -369,6 +386,8 @@ class ManagedProcesses:
                     task.cancel()
             await asyncio.gather(waiter, *readers, return_exceptions=True)
             record.ended_at = time.time()
+            if record.events:
+                await record.events.state(self.status(record), final=True)
             record.done.set()
             record.changed.set()
             self.tool._active_commands -= 1
@@ -396,6 +415,8 @@ class ManagedProcesses:
             record.cancellation_requested = True
             record.state = "cancel_requested"
             record.changed.set()
+            if record.events:
+                record.events.update(self.status(record))
         await self.stop(record, reason)
         # Killing is not the same as reaping. Wait for the supervisor to report
         # the actual return code and whether all output was collected.
@@ -443,6 +464,8 @@ class ManagedProcesses:
             "cancellation_requested": record.cancellation_requested,
             "termination_reason": record.termination_reason,
             "output_complete": record.output_complete,
+            "observer_available": record.events is not None,
+            "observer_dropped_events": record.events.dropped if record.events else 0,
             "output_error": record.output_error,
             "created_at": record.created_at,
             "ended_at": record.ended_at,

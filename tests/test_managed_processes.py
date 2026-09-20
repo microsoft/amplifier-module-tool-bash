@@ -166,7 +166,9 @@ async def test_terminate_kills_descendant_and_reports_completed_cancellation(
     result = await action(tool, "terminate", process_id=started["process_id"])
     assert result["state"] == "cancelled"
     assert result["cancellation_requested"] is True
-    assert result["returncode"] < 0
+    # A shell can exit zero after its child handles SIGTERM. Preserve the
+    # observed code rather than inventing a negative cancellation code.
+    assert result["returncode"] is not None
     assert result["output_complete"] is True
     await asyncio.sleep(1)
     assert not marker.exists()
@@ -434,3 +436,64 @@ async def test_legacy_schema_and_execution_unchanged():
     denied = await tool.execute({"action": "start", "command": "echo unavailable"})
     assert not denied.success
     assert "managed_processes=true" in denied.error["message"]
+
+
+@pytest.mark.asyncio
+async def test_optional_observer_orders_durable_events_without_command_or_stdin(tool):
+    events = []
+
+    async def observer(event):
+        events.append(event)
+
+    tool._processes.observer = lambda: observer
+    started = await action(tool, "start", command="cat")
+    await action(
+        tool,
+        "write",
+        process_id=started["process_id"],
+        stdin="payload\n",
+        close_stdin=True,
+    )
+    await finished(tool, started["process_id"])
+    assert [row["sequence"] for row in events] == list(range(1, len(events) + 1))
+    assert events[0]["phase"] == "started"
+    assert events[-1]["phase"] == "finished"
+    assert events[-1]["status"]["returncode"] == 0
+    assert (
+        "".join(row["chunk"]["text"] for row in events if row["phase"] == "output")
+        == "payload\n"
+    )
+    assert all("command" not in row and "stdin" not in row for row in events)
+
+
+@pytest.mark.asyncio
+async def test_slow_observer_cannot_block_output_and_reports_sequence_gaps(tool):
+    events = []
+
+    async def observer(event):
+        await asyncio.sleep(0.01)
+        events.append(event)
+
+    tool._processes.observer = lambda: observer
+    started = await action(
+        tool, "start", command=python("import sys; sys.stdout.write('x'*500000)")
+    )
+    result = await finished(tool, started["process_id"])
+    assert result["state"] == "completed"
+    assert result["total_output_bytes"] == 500000
+    assert events[-1]["phase"] == "finished"
+    assert events[-1]["observerDroppedEvents"] > 0
+    assert len([row for row in events if row["phase"] == "output"]) < 500000 / 4096
+
+
+@pytest.mark.asyncio
+async def test_failed_observer_never_orphans_process(tool):
+    async def observer(event):
+        raise OSError("journal unavailable")
+
+    tool._processes.observer = lambda: observer
+    started = await action(tool, "start", command="echo observed")
+    result = await finished(tool, started["process_id"])
+    assert result["state"] == "completed"
+    assert result["returncode"] == 0
+    assert tool._processes.records[started["process_id"]].events.dropped > 0

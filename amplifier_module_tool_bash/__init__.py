@@ -907,6 +907,8 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             config = {**config, "working_dir": working_dir}
 
     tool = BashTool(config)
+    if tool._processes is not None:
+        tool._processes.observer = lambda: coordinator.get_capability("operations.observe")
     await coordinator.mount("tools", tool, name=tool.name)
     logger.info("Mounted BashTool")
     if tool.managed_processes:
