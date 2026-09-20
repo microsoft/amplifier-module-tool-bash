@@ -304,19 +304,32 @@ class ManagedProcesses:
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         while raw := await reader.read(4096):
             rendered, binary = self.tool._guard_binary_output(raw, stream)
+            encoding_loss = False
+            try:
+                # Strict incremental probing distinguishes a split character
+                # from bytes that cannot be reconstructed from rendered text.
+                codecs.utf_8_decode(decoder.getstate()[0] + raw, "strict", False)
+            except UnicodeDecodeError:
+                encoding_loss = True
             if binary:
                 # Preserve any pending text before the binary boundary.
                 rendered = decoder.decode(b"", final=True) + rendered
                 decoder.reset()
             else:
                 rendered = decoder.decode(raw)
-            self.append(record, stream, rendered, len(raw), binary)
+            self.append(record, stream, rendered, len(raw), binary, encoding_loss)
         tail = decoder.decode(b"", final=True)
         if tail:
-            self.append(record, stream, tail, 0, False)
+            self.append(record, stream, tail, 0, False, True)
 
     def append(
-        self, record: ProcessRecord, stream: str, text: str, size: int, binary: bool
+        self,
+        record: ProcessRecord,
+        stream: str,
+        text: str,
+        size: int,
+        binary: bool,
+        encoding_loss: bool = False,
     ) -> None:
         record.chunks.append(
             {
@@ -326,6 +339,7 @@ class ManagedProcesses:
                 "text": text,
                 "source_bytes": size,
                 "binary_output_withheld": binary,
+                "encoding_loss": encoding_loss,
             }
         )
         record.cursor += 1

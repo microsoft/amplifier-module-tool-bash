@@ -298,7 +298,9 @@ Events use `schemaVersion: 1`, stable `operationId` (the process handle),
 cancellation requested), and `finished` (observed terminal `status`). Commands
 and stdin are not copied into the observation stream. Output is already subject
 to the normal binary guard and can contain sensitive command results; the host
-owns private storage and presentation policy.
+owns private storage and presentation policy. Chunks flag `binary_output_withheld`
+and `encoding_loss` when rendered text cannot preserve the original bytes; a
+host must treat either as incomplete original evidence, including after exit.
 
 Each process has a bounded 32-event mailbox. Subprocess readers never await the
 observer. Async observer calls have a 500 ms deadline; synchronous observers must

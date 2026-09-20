@@ -139,8 +139,21 @@ async def test_split_utf8_and_binary_output(tool):
     await action(tool, "write", process_id=started["process_id"], stdin="go\n")
     result = await finished(tool, started["process_id"])
     assert text(result) == "€"
+    assert not any(
+        c["encoding_loss"] for c in result["chunks"] if c["stream"] == "stdout"
+    )
     assert any(chunk["binary_output_withheld"] for chunk in result["chunks"])
     assert "withheld" in text(result, "stderr").lower()
+
+
+@pytest.mark.asyncio
+async def test_lossy_utf8_is_explicit_in_output_evidence(tool):
+    started = await action(
+        tool, "start", command=python("import os; os.write(1,b'hello\\xffworld')")
+    )
+    result = await finished(tool, started["process_id"])
+    assert any(chunk["encoding_loss"] for chunk in result["chunks"])
+    assert result["returncode"] == 0
 
 
 @pytest.mark.asyncio
