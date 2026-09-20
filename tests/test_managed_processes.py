@@ -292,6 +292,36 @@ async def test_followup_rejects_command_approval_spoofing(tool):
 
 
 @pytest.mark.asyncio
+async def test_uncertain_write_closes_input_and_cannot_be_retried(tool, monkeypatch):
+    started = await action(tool, "start", command="cat")
+    record = tool._processes.records[started["process_id"]]
+    monkeypatch.setattr(
+        record.process.stdin, "drain", AsyncMock(side_effect=TimeoutError)
+    )
+    result = await tool.execute(
+        {
+            "action": "write",
+            "process_id": started["process_id"],
+            "stdin": "possibly delivered\n",
+        }
+    )
+    assert not result.success
+    assert "outcome unknown" in result.error["message"]
+    assert record.process.stdin.is_closing()
+    retry = await tool.execute(
+        {
+            "action": "write",
+            "process_id": started["process_id"],
+            "stdin": "must not retry\n",
+        }
+    )
+    assert not retry.success
+    assert "closed" in retry.error["message"]
+    output = await finished(tool, started["process_id"])
+    assert "must not retry" not in text(output)
+
+
+@pytest.mark.asyncio
 async def test_mount_returns_owned_cleanup_callback():
     coordinator = AsyncMock()
     coordinator.get_capability = lambda name: None
