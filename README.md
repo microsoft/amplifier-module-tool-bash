@@ -93,6 +93,98 @@ config = {
 
 > **Note**: If `working_dir` is not set in config, the module uses the `session.working_dir` coordinator capability if available, falling back to `Path.cwd()`. This enables correct behavior in server/web deployments where the process cwd differs from the user's project directory.
 
+## Optional managed process sessions
+
+Set `managed_processes = true` in the tool's host configuration to expose
+additional actions on the existing `bash` tool. Ordinary calls (or
+`action = "run"`) and `run_in_background` keep their existing behavior. Managed
+processes currently support POSIX hosts (Linux/macOS/WSL Python); native Windows
+hosts return an explicit unsupported error for `start`. Pipes are supported;
+PTY/terminal applications are not.
+
+```python
+# All actions must use the host's ordinary tool dispatcher and approval hooks.
+started = await session.call_tool("bash", {
+    "action": "start", "command": "npm run build", "timeout": 300
+})
+process_id = started.output["process_id"]
+page = await session.call_tool("bash", {
+    "action": "wait", "process_id": process_id,
+    "cursor": started.output["next_cursor"], "wait_ms": 1000
+})
+```
+
+| Action | Parameters and behavior |
+| --- | --- |
+| `start` | `command` required; `timeout` is the maximum process lifetime in seconds (1–3600, default tool timeout). Returns immediately after spawn with an opaque `process_id`. |
+| `read` | `process_id`, `cursor` (default 0), `max_bytes` (4096–100000, default 16384). Reads an output page without consuming it globally. |
+| `wait` | Same as `read`, plus `wait_ms` (0–60000, default 1000). Waits for new output or completion. Expiration does not cancel the process. |
+| `status` | `process_id`. Returns process state and counters without output chunks. |
+| `write` | `process_id`, optional `stdin` (at most 65536 UTF-8 bytes) and `close_stdin` (EOF). Raw input requires the host policy below. |
+| `terminate` | `process_id`. Requests cancellation, cleans up the owned process group and waits for observation of the result. Repeating it after completion is harmless. |
+| `list` | Lists only processes owned by this mounted tool instance. |
+
+Follow-up actions reject `command`, `timeout`, and `run_in_background`, including
+an innocuous `command` added to match a shell auto-approval rule. Every action
+retains the tool name `bash`, approval metadata, and normal `tool:pre`/`tool:post`
+attribution; tools do not dispatch around approval hooks. Hosts must present
+the action, target process, and input in approval details. A generic command
+allowlist is not an authorization policy for interactive input.
+
+Raw stdin is disabled by default. To grant it, trusted mount configuration
+must set **both** `managed_stdin = true` and `safety_profile = "unrestricted"`,
+with no `allowed_commands`, `denied_commands`, or `safety_overrides`. These are
+host options, never tool arguments. Input to an interpreter cannot be safely
+validated as an independent bash command, so restricted profiles fail closed
+instead of letting stdin evade their command policy. `close_stdin` without data
+remains available. Applications needing a finer input policy should wait for a
+host stdin-authorization adapter. Input writes are not idempotent: a cancelled
+or timed-out write may already have delivered bytes; never automatically retry.
+
+Responses contain `state` (`running`, `cancel_requested`, `completed`, `failed`,
+`cancelled`, or `outcome_unknown`), the observed `returncode` (null until known),
+`cancellation_requested`, `termination_reason` (`cancel`, `timeout`,
+`session_closed`, or null), and `output_complete`. A successfully observed
+nonzero exit has `ToolResult.success = true` with `state = "failed"`: the tool
+action succeeded; the command did not. Read `state` and `returncode` to judge
+command success. Cancellation requested is distinct from cancellation observed;
+terminating a command already observed as exited preserves its exit result.
+
+Output is an ordered list of `chunks` containing stream, text, source byte
+count, and cursor. Stdout/stderr retain their stream identities; their combined
+order is the order the host read them, not a guarantee of inter-stream write
+order. UTF-8 split across reads is preserved. Binary chunks use the ordinary
+bash binary-output guard. Advance to `next_cursor` only after consuming the
+page; rereading a cursor is repeatable while retained. `has_more` reports more
+buffered output. Cursors are chunk sequence numbers, not byte offsets.
+
+The buffer retains at most `managed_max_output_bytes` (default 100000, allowed
+4096–10000000) and 1024 chunks per process. Older output is dropped with explicit
+`dropped_output_bytes`, `earliest_cursor`, and `cursor_expired` metadata. A
+stale cursor returns retained output and signals the gap; it never pretends to
+have complete historical output. For durable full output, arrange a file or a
+host-owned output collector. `max_bytes` budgets raw source bytes; rendered
+replacement characters and binary notices can have different text sizes.
+
+Process handles belong to one mounted tool instance. They cannot be read or
+terminated by another session, including a fork. `max_concurrent` counts managed
+processes throughout their lifetime together with ordinary foreground calls.
+`managed_max_processes` bounds retained records (default 32, allowed 1–256);
+once full, a new start evicts the oldest completed record or rejects if all are
+still active. Evicted IDs fail explicitly.
+
+The cleanup callback returned by `mount` must be run when the owning session
+closes. It terminates owned groups and collects final exit/output state, including
+starts racing with shutdown. A normal command exit also closes its remaining
+process group. Process-tree cleanup uses the existing POSIX descendant discovery
+and group teardown; deliberately escaped/reparented external processes cannot be
+guaranteed to remain owned. Abrupt host death cannot run cleanup.
+
+This is an **in-memory lifecycle**, not a durable process broker. A host restart
+does not restore handles, output, or observation, and never replays commands.
+Hosts persisting operation receipts should mark interrupted observations as
+outcome unknown after restart, and must not infer completion or retry mutations.
+
 ## Safety Profiles
 
 The bash tool uses a profile-based safety system with smart pattern matching.
