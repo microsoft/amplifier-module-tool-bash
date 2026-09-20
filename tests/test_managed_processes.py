@@ -209,7 +209,10 @@ async def test_session_ownership_and_cleanup(tool):
             {"action": "terminate", "process_id": started["process_id"]}
         )
     ).success
-    assert (await action(other, "list"))["processes"] == []
+    listing = await action(other, "list")
+    assert listing["processes"] == []
+    assert listing["stdin_allowed"] is False
+    assert listing["pty"] is False
     await tool.close()
     record = tool._processes.records[started["process_id"]]
     assert record.done.is_set()

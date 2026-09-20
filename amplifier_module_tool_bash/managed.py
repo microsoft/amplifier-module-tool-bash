@@ -168,6 +168,8 @@ class ManagedProcesses:
                     success=True,
                     output={
                         "owner_id": self.owner_id,
+                        "stdin_allowed": self.allow_stdin,
+                        "pty": False,
                         "processes": [
                             self.status(record) for record in self.records.values()
                         ],

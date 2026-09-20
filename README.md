@@ -283,6 +283,10 @@ trademarks or logos is subject to and must follow
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.
 
+`list` also reports trusted `stdin_allowed` and `pty` availability, so hosts can
+fail closed before opening an interpreter. These are observed mount policies,
+not action-settable permissions.
+
 ### Optional operation observer capability
 
 A host can register `operations.observe` on the coordinator as a local callable
