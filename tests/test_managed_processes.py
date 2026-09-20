@@ -513,3 +513,134 @@ async def test_failed_observer_never_orphans_process(tool):
     assert result["state"] == "completed"
     assert result["returncode"] == 0
     assert tool._processes.records[started["process_id"]].events.dropped > 0
+
+
+@pytest.mark.asyncio
+async def test_required_question_admission_is_checked_immediately_before_spawn(
+    tool, tmp_path
+):
+    target = tmp_path / "must-not-exist"
+    command = python(f"from pathlib import Path; Path({str(target)!r}).touch()")
+    absent = await tool.execute(
+        {"action": "start", "command": command, "question_ids": ["q1"]}
+    )
+    assert not absent.success and "cannot be verified" in absent.error["message"]
+    assert not target.exists()
+    callback = AsyncMock(side_effect=ValueError("Question was superseded"))
+    tool._processes.admission = lambda: callback
+    denied = await tool.execute(
+        {"action": "start", "command": command, "question_ids": ["q1"]}
+    )
+    assert not denied.success and "superseded" in denied.error["message"]
+    assert not target.exists()
+    assert tool._active_commands == 0
+    callback.side_effect = None
+    allowed = await action(tool, "start", command=command, question_ids=["q1"])
+    await finished(tool, allowed["process_id"])
+    callback.assert_awaited_with(["q1"])
+    assert target.exists()
+
+
+@pytest.mark.asyncio
+async def test_opt_in_terminal_is_real_and_input_eof_retains_output(tmp_path):
+    tool = BashTool(
+        {
+            "managed_processes": True,
+            "managed_stdin": True,
+            "managed_pty": True,
+            "safety_profile": "unrestricted",
+        }
+    )
+    try:
+        started = await action(
+            tool,
+            "start",
+            pty=True,
+            command=python(
+                "import os,sys; print('tty='+str(os.isatty(0))+','+str(os.isatty(1))); print('got:'+sys.stdin.readline().strip()); print('tail:'+sys.stdin.read()); print('err',file=sys.stderr)"
+            ),
+        )
+        first = await action(
+            tool, "wait", process_id=started["process_id"], wait_ms=3000
+        )
+        assert "tty=True,True" in text(first)
+        assert first["pty"] is True and first["output_streams"] == "merged"
+        await action(
+            tool,
+            "write",
+            process_id=started["process_id"],
+            stdin="terminal-input\n",
+            close_stdin=True,
+        )
+        result = await finished(tool, started["process_id"])
+        assert result["state"] == "completed" and result["returncode"] == 0
+        assert result["output_complete"] is True
+        assert "got:terminal-input" in text(result) and "err" in text(result)
+        assert result["stdin_closed"] is True
+        assert all(chunk["stream"] == "stdout" for chunk in result["chunks"])
+    finally:
+        await tool.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_needs_host_opt_in_and_cancellation_observes_exit(tool):
+    denied = await tool.execute(
+        {"action": "start", "command": "printf no", "pty": True}
+    )
+    assert not denied.success and "managed_pty=true" in denied.error["message"]
+    terminal = BashTool(
+        {
+            "managed_processes": True,
+            "managed_pty": True,
+            "safety_profile": "unrestricted",
+        }
+    )
+    try:
+        started = await action(
+            terminal, "start", command=python("import time; time.sleep(30)"), pty=True
+        )
+        result = await action(terminal, "terminate", process_id=started["process_id"])
+        assert result["state"] == "cancelled"
+        assert result["returncode"] is not None
+        assert terminal._active_commands == 0
+    finally:
+        await terminal.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_stdin_policy_still_applies_and_raw_eof_is_refused():
+    tool = BashTool(
+        {
+            "managed_processes": True,
+            "managed_pty": True,
+            "safety_profile": "unrestricted",
+        }
+    )
+    try:
+        started = await action(
+            tool,
+            "start",
+            command=python(
+                'import tty,time; tty.setraw(0); print("ready",flush=True); time.sleep(30)'
+            ),
+            pty=True,
+        )
+        await action(tool, "wait", process_id=started["process_id"], wait_ms=3000)
+        denied = await tool.execute(
+            {
+                "action": "write",
+                "process_id": started["process_id"],
+                "stdin": "print(1)\n",
+            }
+        )
+        assert not denied.success and "managed_stdin=true" in denied.error["message"]
+        eof = await tool.execute(
+            {
+                "action": "write",
+                "process_id": started["process_id"],
+                "close_stdin": True,
+            }
+        )
+        assert not eof.success and "canonical input mode" in eof.error["message"]
+    finally:
+        await tool.close()

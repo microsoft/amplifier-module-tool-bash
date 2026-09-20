@@ -53,6 +53,8 @@ class ProcessRecord:
     supervisor: asyncio.Task | None = None
     cleanup: asyncio.Task | None = None
     events: Any = None
+    terminal: Any = None
+    question_ids: list[str] = field(default_factory=list)
 
 
 class ManagedProcesses:
@@ -63,7 +65,11 @@ class ManagedProcesses:
         self.owner_id = uuid.uuid4().hex
         self.records: dict[str, ProcessRecord] = {}
         self.closed = False
+        self.allow_pty = (
+            tool.config.get("managed_pty") is True and sys.platform != "win32"
+        )
         self.observer = lambda: None
+        self.admission = lambda: None
         self.lifecycle_lock = asyncio.Lock()
         self.output_limit = integer(
             tool.config.get("managed_max_output_bytes", 100_000),
@@ -106,6 +112,17 @@ class ManagedProcesses:
                     ],
                     "default": "run",
                     "description": "run preserves ordinary bash execution; start creates a session-owned pipe process. command is required only for run/start.",
+                },
+                "pty": {
+                    "type": "boolean",
+                    "description": "start only: opt in to a POSIX terminal when host managed_pty=true; stdout/stderr merge. Default false. Terminal EOF requires canonical input mode.",
+                },
+                "question_ids": {
+                    "type": "array",
+                    "maxItems": 32,
+                    "uniqueItems": True,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "description": "start only: exact questions this work depends on. The host must confirm each is answered immediately before admission; unrelated work omits this list.",
                 },
                 "process_id": {
                     "type": "string",
@@ -159,7 +176,16 @@ class ManagedProcesses:
                 return ToolResult(success=True, output=await self.start(data))
             # Prevent innocuous command values from matching existing command
             # auto-approval rules on an unrelated write/terminate action.
-            if "command" in data or "run_in_background" in data or "timeout" in data:
+            if any(
+                key in data
+                for key in (
+                    "command",
+                    "run_in_background",
+                    "timeout",
+                    "question_ids",
+                    "pty",
+                )
+            ):
                 raise ValueError(
                     "command, timeout and run_in_background are not valid for process follow-ups"
                 )
@@ -169,7 +195,7 @@ class ManagedProcesses:
                     output={
                         "owner_id": self.owner_id,
                         "stdin_allowed": self.allow_stdin,
-                        "pty": False,
+                        "pty": self.allow_pty,
                         "processes": [
                             self.status(record) for record in self.records.values()
                         ],
@@ -186,6 +212,9 @@ class ManagedProcesses:
             max_bytes = integer(data.get("max_bytes", 16384), "max_bytes", 4096, 100000)
             if action == "write":
                 await self.write(record, data)
+                record.changed.set()
+                if record.events:
+                    record.events.update(self.status(record))
             elif action == "terminate":
                 await self.terminate(record, "cancel")
             elif action == "wait":
@@ -232,6 +261,13 @@ class ManagedProcesses:
             raise ValueError(
                 "Managed processes currently require POSIX process groups; ordinary bash execution remains available on Windows"
             )
+        terminal_mode = data.get("pty", False)
+        if not isinstance(terminal_mode, bool):
+            raise ValueError("pty must be boolean")
+        if terminal_mode and not self.allow_pty:
+            raise ValueError(
+                "Terminal execution requires POSIX and host managed_pty=true"
+            )
         timeout = _validate_timeout_seconds(
             data.get("timeout", self.tool.timeout), source="caller"
         )
@@ -255,20 +291,77 @@ class ManagedProcesses:
                     "Managed process record limit reached; terminate a process before starting another"
                 )
             del self.records[completed]
+        question_ids = data.get("question_ids", [])
+        if (
+            not isinstance(question_ids, list)
+            or len(question_ids) > 32
+            or any(
+                not isinstance(q, str) or not 1 <= len(q) <= 200 for q in question_ids
+            )
+            or len(set(question_ids)) != len(question_ids)
+        ):
+            raise ValueError(
+                "question_ids must contain at most 32 unique nonempty question IDs"
+            )
+        if question_ids:
+            admit = self.admission()
+            if not callable(admit):
+                raise ValueError(
+                    "Required question answers cannot be verified by this host"
+                )
+            # execute() is reached after the normal approval hook path. Check
+            # here, under the lifecycle fence and immediately before spawn.
+            await admit(list(question_ids))
+            if self.closed:
+                raise ValueError("The owning process session has been closed")
         self.tool._active_commands += 1
         # Shield the spawn itself so cancellation between fork and registration
         # cannot abandon an unowned child.
-        spawn = asyncio.create_task(
-            asyncio.create_subprocess_shell(
-                command,
-                executable="/bin/bash",
-                cwd=self.tool.working_dir,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
-        )
+        terminal = None
+        slave = None
+        try:
+            if terminal_mode:
+                import os
+                import pty
+                from .pty_transport import PtyTransport
+
+                master, slave = pty.openpty()
+                terminal = PtyTransport(master)
+                # Set the controlling terminal in a fresh interpreter, avoiding
+                # unsafe preexec_fn use in a multithreaded host.
+                launch = "import os,sys,fcntl,termios;fcntl.ioctl(0,termios.TIOCSCTTY,0);os.execv('/bin/bash',['/bin/bash','-c',sys.argv[1]])"
+                spawn = asyncio.create_task(
+                    asyncio.create_subprocess_exec(
+                        sys.executable,
+                        "-c",
+                        launch,
+                        command,
+                        cwd=self.tool.working_dir,
+                        stdin=slave,
+                        stdout=slave,
+                        stderr=slave,
+                        start_new_session=True,
+                    )
+                )
+            else:
+                spawn = asyncio.create_task(
+                    asyncio.create_subprocess_shell(
+                        command,
+                        executable="/bin/bash",
+                        cwd=self.tool.working_dir,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        start_new_session=True,
+                    )
+                )
+        except BaseException:
+            self.tool._active_commands -= 1
+            if terminal:
+                terminal.close()
+            if slave is not None:
+                os.close(slave)
+            raise
         cancelled = False
         try:
             while not spawn.done():
@@ -279,8 +372,19 @@ class ManagedProcesses:
             process = spawn.result()
         except BaseException:
             self.tool._active_commands -= 1
+            if terminal:
+                terminal.close()
             raise
-        record = ProcessRecord(uuid.uuid4().hex, process, timeout)
+        finally:
+            if slave is not None:
+                os.close(slave)
+        record = ProcessRecord(
+            uuid.uuid4().hex,
+            process,
+            timeout,
+            terminal=terminal,
+            question_ids=list(question_ids),
+        )
         observer = self.observer()
         if callable(observer):
             from .process_events import ProcessEvents
@@ -302,7 +406,7 @@ class ManagedProcesses:
         return self.read(record, 0, 16384)
 
     async def drain(self, record: ProcessRecord, stream: str) -> None:
-        reader = getattr(record.process, stream)
+        reader = record.terminal or getattr(record.process, stream)
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         while raw := await reader.read(4096):
             rendered, binary = self.tool._guard_binary_output(raw, stream)
@@ -359,7 +463,7 @@ class ManagedProcesses:
     async def supervise(self, record: ProcessRecord) -> None:
         readers = [
             asyncio.create_task(self.drain(record, stream))
-            for stream in ("stdout", "stderr")
+            for stream in (("stdout",) if record.terminal else ("stdout", "stderr"))
         ]
         waiter = asyncio.create_task(record.process.wait())
         try:
@@ -401,6 +505,8 @@ class ManagedProcesses:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(waiter, *readers, return_exceptions=True)
+            if record.terminal:
+                record.terminal.close()
             record.ended_at = time.time()
             if record.events:
                 await record.events.state(self.status(record), final=True)
@@ -451,6 +557,25 @@ class ManagedProcesses:
                 "Raw stdin requires host managed_stdin=true, safety_profile=unrestricted, and no command allow/deny/override restrictions. close_stdin alone is permitted."
             )
         async with record.write_lock:
+            if record.terminal:
+                terminal = record.terminal
+                if (
+                    record.process.returncode is not None
+                    or terminal.closed
+                    or terminal.input_closed
+                ):
+                    raise ValueError("Process stdin is closed")
+                eof = terminal.eof_bytes() if close_stdin else b""
+                try:
+                    await asyncio.wait_for(terminal.write(raw + eof), 5)
+                except TimeoutError as exc:
+                    terminal.input_closed = True
+                    raise ValueError(
+                        "Stdin delivery outcome unknown after 5 seconds; do not automatically retry"
+                    ) from exc
+                if close_stdin:
+                    terminal.input_closed = True
+                return
             writer = record.process.stdin
             if record.process.returncode is not None or writer.is_closing():
                 raise ValueError("Process stdin is closed")
@@ -487,7 +612,15 @@ class ManagedProcesses:
             "ended_at": record.ended_at,
             "timeout": record.timeout,
             "stdin_allowed": self.allow_stdin,
-            "stdin_closed": record.process.stdin.is_closing(),
+            "stdin_closed": (record.terminal.input_closed or record.terminal.closed)
+            if record.terminal
+            else record.process.stdin.is_closing(),
+            "pty": record.terminal is not None,
+            "question_ids": list(record.question_ids),
+            "output_streams": "merged" if record.terminal else "separate",
+            "eof_semantics": "canonical_terminal_eof"
+            if record.terminal
+            else "pipe_half_close",
             "total_output_bytes": record.total_bytes,
             "dropped_output_bytes": record.dropped_bytes,
             "earliest_cursor": record.chunks[0]["cursor"]

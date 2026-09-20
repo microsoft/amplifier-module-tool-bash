@@ -909,6 +909,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     tool = BashTool(config)
     if tool._processes is not None:
         tool._processes.observer = lambda: coordinator.get_capability("operations.observe")
+        tool._processes.admission = lambda: coordinator.get_capability("questions.admit")
     await coordinator.mount("tools", tool, name=tool.name)
     logger.info("Mounted BashTool")
     if tool.managed_processes:
@@ -1024,7 +1025,7 @@ Constraints:
             self._processes = ManagedProcesses(self)
             self.description = self.description.replace(
                 "- Interactive commands (-i flags, editors requiring input) are not supported and will fail.",
-                "- Managed action=start returns an owned process_id. Use read/wait/status/write/terminate/list to manage it. Pipes only; no PTY. Raw stdin requires host permission.",
+                "- Managed action=start returns an owned process_id. Use read/wait/status/write/terminate/list to manage it. Optional pty=true requires host managed_pty=true. Raw stdin requires host permission.",
             )
 
         # Cache for WSL bash detection to avoid repeated checks
@@ -1158,6 +1159,13 @@ Constraints:
         if self._processes is not None:
             schema = self._processes.extend_schema(schema)
         return schema
+
+    def validate_process_owner(self, process_id, owner_id):
+        """Verify an exact mounted owner before a host control executes."""
+        if (self._processes is None or self._processes.closed
+                or self._processes.owner_id != owner_id
+                or process_id not in self._processes.records):
+            raise ValueError("The process belongs to a different or retired mounted owner")
 
     async def close(self) -> None:
         """End managed commands when their owning mounted session is closed."""

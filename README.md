@@ -99,8 +99,11 @@ Set `managed_processes = true` in the tool's host configuration to expose
 additional actions on the existing `bash` tool. Ordinary calls (or
 `action = "run"`) and `run_in_background` keep their existing behavior. Managed
 processes currently support POSIX hosts (Linux/macOS/WSL Python); native Windows
-hosts return an explicit unsupported error for `start`. Pipes are supported;
-PTY/terminal applications are not.
+hosts return an explicit unsupported error for `start`. Pipes are the default.
+Set trusted host `managed_pty = true` and per-start `pty = true` for a real
+POSIX controlling terminal. Terminal output combines stdout/stderr; `pty`,
+`output_streams`, and `eof_semantics` identify this in every status receipt.
+Terminal sizing and attaching after host death are not provided.
 
 ```python
 # All actions must use the host's ordinary tool dispatcher and approval hooks.
@@ -116,7 +119,7 @@ page = await session.call_tool("bash", {
 
 | Action | Parameters and behavior |
 | --- | --- |
-| `start` | `command` required; `timeout` is the maximum process lifetime in seconds (1–3600, default tool timeout). Returns immediately after spawn with an opaque `process_id`. |
+| `start` | `command` required; `timeout` is the maximum process lifetime in seconds (1–3600, default tool timeout). Returns immediately after spawn with an opaque `process_id`. Optional `pty` requires host opt-in; `question_ids` binds exact required answers. |
 | `read` | `process_id`, `cursor` (default 0), `max_bytes` (4096–100000, default 16384). Reads an output page without consuming it globally. |
 | `wait` | Same as `read`, plus `wait_ms` (0–60000, default 1000). Waits for new output or completion. Expiration does not cancel the process. |
 | `status` | `process_id`. Returns process state and counters without output chunks. |
@@ -137,7 +140,9 @@ with no `allowed_commands`, `denied_commands`, or `safety_overrides`. These are
 host options, never tool arguments. Input to an interpreter cannot be safely
 validated as an independent bash command, so restricted profiles fail closed
 instead of letting stdin evade their command policy. `close_stdin` without data
-remains available. Applications needing a finer input policy should wait for a
+remains available for pipes. For a terminal it sends canonical EOF and disables
+further input from this handle; raw-mode terminals reject EOF explicitly because
+a terminal cannot be half-closed like a pipe. Applications needing a finer input policy should wait for a
 host stdin-authorization adapter. Input writes are not idempotent: a cancelled
 or timed-out write may already have delivered bytes; never automatically retry.
 
@@ -322,3 +327,13 @@ owner. The module's local output ring can expire independently of a host's
 archive. `output_complete` on process status means streams were drained, not
 that either archive retains every byte. The observer's task and callbacks end
 with the owned process; no observation or execution is restarted automatically.
+
+
+Managed starts may include `question_ids` (at most 32 unique IDs). The module
+uses the optional trusted `questions.admit` capability under its lifecycle fence
+immediately before spawning, after the host dispatcher has completed approvals.
+Absent capability, pending/cancelled/superseded or wrong-conversation answers
+fail closed. Omitting the list leaves independent work independent. This is a
+dependency check, never a substitute for tool permission. Hosts can call the
+public `validate_process_owner(process_id, owner_id)` immediately after approval
+to verify an identity-bound control against the mounted owner.
