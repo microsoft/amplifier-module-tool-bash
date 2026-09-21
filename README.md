@@ -334,6 +334,8 @@ uses the optional trusted `questions.admit` capability under its lifecycle fence
 immediately before spawning, after the host dispatcher has completed approvals.
 Absent capability, pending/cancelled/superseded or wrong-conversation answers
 fail closed. Omitting the list leaves independent work independent. This is a
-dependency check, never a substitute for tool permission. Hosts can call the
+dependency check, never a substitute for tool permission. The capability must
+return `{"admitted": true, "questionIds": [the exact IDs]}`; silence, false and
+mismatched acknowledgment never admit work. Hosts can call the
 public `validate_process_owner(process_id, owner_id)` immediately after approval
 to verify an identity-bound control against the mounted owner.

@@ -535,6 +535,7 @@ async def test_required_question_admission_is_checked_immediately_before_spawn(
     assert not target.exists()
     assert tool._active_commands == 0
     callback.side_effect = None
+    callback.return_value = {"admitted": True, "questionIds": ["q1"]}
     allowed = await action(tool, "start", command=command, question_ids=["q1"])
     await finished(tool, allowed["process_id"])
     callback.assert_awaited_with(["q1"])
@@ -644,3 +645,23 @@ async def test_terminal_stdin_policy_still_applies_and_raw_eof_is_refused():
         assert not eof.success and "canonical input mode" in eof.error["message"]
     finally:
         await tool.close()
+
+
+@pytest.mark.asyncio
+async def test_question_admission_requires_explicit_exact_acknowledgment(
+    tool, tmp_path
+):
+    target = tmp_path / "absent"
+    command = python(f"from pathlib import Path; Path({str(target)!r}).touch()")
+    for response in (
+        None,
+        {},
+        {"admitted": False, "questionIds": ["q1"]},
+        {"admitted": True, "questionIds": ["other"]},
+    ):
+        tool._processes.admission = lambda: AsyncMock(return_value=response)
+        result = await tool.execute(
+            {"action": "start", "command": command, "question_ids": ["q1"]}
+        )
+        assert not result.success and "did not confirm" in result.error["message"]
+        assert not target.exists()

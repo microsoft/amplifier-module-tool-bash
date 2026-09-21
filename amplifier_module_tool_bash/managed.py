@@ -311,7 +311,15 @@ class ManagedProcesses:
                 )
             # execute() is reached after the normal approval hook path. Check
             # here, under the lifecycle fence and immediately before spawn.
-            await admit(list(question_ids))
+            acknowledgment = await admit(list(question_ids))
+            if (
+                not isinstance(acknowledgment, dict)
+                or acknowledgment.get("admitted") is not True
+                or acknowledgment.get("questionIds") != question_ids
+            ):
+                raise ValueError(
+                    "The host did not confirm these exact question answers"
+                )
             if self.closed:
                 raise ValueError("The owning process session has been closed")
         self.tool._active_commands += 1
