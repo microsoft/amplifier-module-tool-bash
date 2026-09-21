@@ -278,6 +278,66 @@ async def test_managed_and_ordinary_commands_share_concurrency_limit():
 
 
 @pytest.mark.asyncio
+async def test_question_admission_rechecks_capacity_after_ordinary_start(monkeypatch):
+    tool = BashTool({"managed_processes": True, "max_concurrent": 1})
+    entered, admitted, running = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original = tool._run_command
+
+    async def admit(ids):
+        entered.set()
+        await admitted.wait()
+        return {"admitted": True, "questionIds": ids}
+
+    async def observe_ordinary(command, **kwargs):
+        # execute() has already reserved the ordinary command's slot.
+        running.set()
+        return await original(command, **kwargs)
+
+    tool._processes.admission = lambda: admit
+    monkeypatch.setattr(tool, "_run_command", observe_ordinary)
+    managed = asyncio.create_task(tool.execute({
+        "action": "start", "command": "sleep 30", "question_ids": ["q1"]
+    }))
+    ordinary = None
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        ordinary = asyncio.create_task(tool.execute({"command": "sleep 30"}))
+        await asyncio.wait_for(running.wait(), 5)
+        admitted.set()
+        result = await asyncio.wait_for(managed, 5)
+        assert not result.success
+        assert "concurrent command limit" in result.error["message"]
+        assert tool._active_commands == 1
+        assert (await action(tool, "list"))["processes"] == []
+    finally:
+        admitted.set()
+        if not managed.done():
+            managed.cancel()
+        await asyncio.gather(managed, return_exceptions=True)
+        if ordinary is not None:
+            ordinary.cancel()
+            await asyncio.gather(ordinary, return_exceptions=True)
+        await tool.close()
+    assert tool._active_commands == 0
+
+
+@pytest.mark.asyncio
+async def test_refused_question_admission_preserves_completed_record():
+    tool = BashTool({"managed_processes": True, "managed_max_processes": 1})
+    try:
+        started = await action(tool, "start", command="echo retained-result")
+        before = await finished(tool, started["process_id"])
+        result = await tool.execute({
+            "action": "start", "command": "echo blocked", "question_ids": ["missing"]
+        })
+        assert not result.success
+        after = await action(tool, "read", process_id=started["process_id"])
+        assert after == before
+    finally:
+        await tool.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "config",
     [

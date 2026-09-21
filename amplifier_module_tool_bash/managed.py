@@ -281,16 +281,6 @@ class ManagedProcesses:
             raise ValueError(
                 f"Command rejected: concurrent command limit of {self.tool.max_concurrent} reached"
             )
-        if len(self.records) >= self.record_limit:
-            completed = next(
-                (key for key, value in self.records.items() if value.done.is_set()),
-                None,
-            )
-            if completed is None:
-                raise ValueError(
-                    "Managed process record limit reached; terminate a process before starting another"
-                )
-            del self.records[completed]
         question_ids = data.get("question_ids", [])
         if (
             not isinstance(question_ids, list)
@@ -322,6 +312,27 @@ class ManagedProcesses:
                 )
             if self.closed:
                 raise ValueError("The owning process session has been closed")
+            # Ordinary run actions do not take the managed lifecycle lock and
+            # can reserve the last slot while question admission is awaited.
+            if (
+                self.tool.max_concurrent is not None
+                and self.tool._active_commands >= self.tool.max_concurrent
+            ):
+                raise ValueError(
+                    f"Command rejected: concurrent command limit of {self.tool.max_concurrent} reached"
+                )
+        # A rejected admission must not discard a completed process's output.
+        # Prune only after all pre-spawn checks, with no await before reservation.
+        if len(self.records) >= self.record_limit:
+            completed = next(
+                (key for key, value in self.records.items() if value.done.is_set()),
+                None,
+            )
+            if completed is None:
+                raise ValueError(
+                    "Managed process record limit reached; terminate a process before starting another"
+                )
+            del self.records[completed]
         self.tool._active_commands += 1
         # Shield the spawn itself so cancellation between fork and registration
         # cannot abandon an unowned child.
