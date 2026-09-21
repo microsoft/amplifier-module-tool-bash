@@ -789,7 +789,8 @@ def _arbitrate_windows_shell(
         return gitbash_exe, False
     return None, False
 async def _cleanup_process_tree(
-    process: asyncio.subprocess.Process, *, pgid: int | None, is_windows: bool
+    process: asyncio.subprocess.Process, *, pgid: int | None, is_windows: bool,
+    reap: bool = True,
 ) -> None:
     """Best-effort termination of a subprocess and its descendants.
 
@@ -830,6 +831,11 @@ async def _cleanup_process_tree(
     else:
         # Windows or no pgid: kill just the main process
         process.kill()
+
+    # Managed sessions already have dedicated stream readers. Do not compete
+    # with those readers by calling communicate() a second time.
+    if not reap:
+        return
 
     # Reap / close pipes (best-effort)
     try:
@@ -901,8 +907,13 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             config = {**config, "working_dir": working_dir}
 
     tool = BashTool(config)
+    if tool._processes is not None:
+        tool._processes.observer = lambda: coordinator.get_capability("operations.observe")
+        tool._processes.admission = lambda: coordinator.get_capability("questions.admit")
     await coordinator.mount("tools", tool, name=tool.name)
     logger.info("Mounted BashTool")
+    if tool.managed_processes:
+        return tool.close
     return
 
 
@@ -1003,6 +1014,19 @@ Constraints:
         # Concurrency limit: maximum number of commands that can run simultaneously
         self.max_concurrent = config.get("max_concurrent", None)
         self._active_commands = 0
+
+        # Opt-in: existing schemas, descriptions and background semantics stay
+        # unchanged for callers that have not enabled owned process sessions.
+        self.managed_processes = config.get("managed_processes", False)
+        self._processes = None
+        if self.managed_processes:
+            from .managed import ManagedProcesses
+
+            self._processes = ManagedProcesses(self)
+            self.description = self.description.replace(
+                "- Interactive commands (-i flags, editors requiring input) are not supported and will fail.",
+                "- Managed action=start returns an owned process_id. Use read/wait/status/write/terminate/list to manage it. Optional pty=true requires host managed_pty=true. Raw stdin requires host permission.",
+            )
 
         # Cache for WSL bash detection to avoid repeated checks
         self._wsl_bash_cache: dict[str, bool] = {}
@@ -1114,7 +1138,7 @@ Constraints:
     @property
     def input_schema(self) -> dict:
         """Return JSON schema for tool parameters."""
-        return {
+        schema = {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Bash command to execute"},
@@ -1132,6 +1156,21 @@ Constraints:
             },
             "required": ["command"],
         }
+        if self._processes is not None:
+            schema = self._processes.extend_schema(schema)
+        return schema
+
+    def validate_process_owner(self, process_id, owner_id):
+        """Verify an exact mounted owner before a host control executes."""
+        if (self._processes is None or self._processes.closed
+                or self._processes.owner_id != owner_id
+                or process_id not in self._processes.records):
+            raise ValueError("The process belongs to a different or retired mounted owner")
+
+    async def close(self) -> None:
+        """End managed commands when their owning mounted session is closed."""
+        if self._processes is not None:
+            await self._processes.close()
 
     def get_metadata(self) -> dict[str, Any]:
         """Return tool metadata for approval system."""
@@ -1154,6 +1193,13 @@ Constraints:
         Returns:
             Tool result with command output
         """
+        action = input.get("action", "run")
+        if action != "run":
+            if self._processes is None:
+                message = "Managed process actions require managed_processes=true in host configuration"
+                return ToolResult(success=False, error={"message": message}, output=message)
+            return await self._processes.execute(input)
+
         command = input.get("command")
         if not command:
             error_msg = "Command is required"
