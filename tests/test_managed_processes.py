@@ -167,23 +167,60 @@ async def test_timeout_is_failed_with_real_signal_code(tool):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("slow_scan", [False, True])
 async def test_terminate_kills_descendant_and_reports_completed_cancellation(
-    tool, tmp_path
+    tool, tmp_path, monkeypatch, slow_scan
 ):
+    if slow_scan:
+        import time
+        import amplifier_module_tool_bash as module
+
+        original = module._find_descendant_pids
+
+        def delayed_scan(pid):
+            # The portable macOS process-table fallback can be slow under load.
+            time.sleep(1.25)
+            return original(pid)
+
+        monkeypatch.setattr(module, "_find_descendant_pids", delayed_scan)
     marker = tmp_path / "should-not-exist"
-    # Child would write after the parent terminates if process group teardown
-    # only killed the shell. Its output pipes also keep collection open.
-    started = await action(
-        tool, "start", command=f"(sleep 1; touch {shlex.quote(str(marker))}) & wait"
+    gate = tmp_path / "release-after-cancel"
+    # No wall-clock deadline: a slow process-table scan can legitimately allow
+    # a timed side effect before SIGTERM. Instead the real descendant announces
+    # readiness and cannot write until this test releases it AFTER cancellation.
+    # If cleanup kills only the shell, the descendant also keeps its output pipe
+    # open, so truthful output_complete cannot pass.
+    child = python(
+        "from pathlib import Path; import time; "
+        f"gate=Path({str(gate)!r}); marker=Path({str(marker)!r}); "
+        "print('descendant-ready', flush=True)\n"
+        "while not gate.exists(): time.sleep(.01)\n"
+        "marker.touch(); print('descendant-survived', flush=True)"
     )
-    result = await action(tool, "terminate", process_id=started["process_id"])
+    started = await action(tool, "start", command=f"{child} & wait")
+    observed, cursor = text(started), started["next_cursor"]
+    async with asyncio.timeout(10):
+        while "descendant-ready" not in observed:
+            update = await action(tool, "wait", process_id=started["process_id"],
+                                  cursor=cursor, wait_ms=5000)
+            observed += text(update)
+            cursor = update["next_cursor"]
+    assert not marker.exists()
+    try:
+        result = await asyncio.wait_for(
+            action(tool, "terminate", process_id=started["process_id"]), 10
+        )
+    finally:
+        # Also release a surviving child if the assertion path fails, keeping
+        # the negative case bounded instead of leaving an orphaned fixture.
+        gate.touch()
     assert result["state"] == "cancelled"
     assert result["cancellation_requested"] is True
     # A shell can exit zero after its child handles SIGTERM. Preserve the
     # observed code rather than inventing a negative cancellation code.
     assert result["returncode"] is not None
     assert result["output_complete"] is True
-    await asyncio.sleep(1)
+    assert "descendant-survived" not in text(result)
     assert not marker.exists()
     assert (await action(tool, "terminate", process_id=started["process_id"]))[
         "state"
