@@ -9,6 +9,8 @@ authors = [
     { name = "Microsoft MADE:Explorations Team" },
 ]
 dependencies = [
+    "tree-sitter-bash>=0.25.1",
+    "tree-sitter>=0.24,<0.26",
 ]
 
 [project.entry-points."amplifier.modules"]
