@@ -6,7 +6,7 @@ that avoids false positives while maintaining security for dangerous commands.
 
 Key Features:
 - Multiple safety profiles (strict, standard, permissive, unrestricted)
-- Smart pattern matching that distinguishes commands from paths/strings
+- Syntax-aware matching that inspects every effective Bash command
 - Configurable allowlists that can override blocklists (profile-dependent)
 - Clear error messages with hints for enabling blocked commands
 
@@ -23,9 +23,39 @@ Example:
 
 from __future__ import annotations
 
+import posixpath
 import re
+import shlex
 from dataclasses import dataclass, field
 from typing import Literal
+
+import tree_sitter_bash
+from tree_sitter import Language, Node, Parser
+
+_BASH_LANGUAGE = Language(tree_sitter_bash.language())
+_DYNAMIC_WORD_NODES = {
+    "arithmetic_expansion",
+    "command_substitution",
+    "expansion",
+    "process_substitution",
+    "simple_expansion",
+}
+_NON_ARGUMENT_NODES = {
+    "comment",
+    "file_redirect",
+    "heredoc_redirect",
+    "variable_assignment",
+}
+
+
+@dataclass(frozen=True)
+class _ShellWord:
+    value: str
+    dynamic: bool = False
+
+
+class _UnsafeShellSyntax(ValueError):
+    """Raised when a restricted profile cannot safely inspect a command."""
 
 
 @dataclass
@@ -243,9 +273,19 @@ class SafetyValidator:
             if self._matches_allowlist(command):
                 return SafetyResult(allowed=True)
 
+        try:
+            parsed_commands = self._parse_shell_commands(command)
+        except _UnsafeShellSyntax as exc:
+            return SafetyResult(
+                allowed=False,
+                reason=f"Unable to safely analyze Bash syntax: {exc}",
+                matched_pattern="<unsupported bash syntax>",
+                hint="Use safety_profile: 'unrestricted' only in a trusted container/VM environment",
+            )
+
         # 3. Check blocked patterns with smart matching
         for pattern in self.profile.blocked_patterns:
-            if self._check_pattern(command, pattern):
+            if self._check_pattern(command, pattern, parsed_commands):
                 return SafetyResult(
                     allowed=False,
                     reason=pattern.reason,
@@ -330,99 +370,234 @@ class SafetyValidator:
 
         return False
 
-    def _find_quoted_regions(self, command: str) -> list[tuple[int, int]]:
-        """Find all single and double quoted regions in a command.
+    def _parse_shell_commands(
+        self, command: str, *, depth: int = 0
+    ) -> list[list[_ShellWord]]:
+        """Parse every simple command, including substitutions and shell -c scripts."""
+        if not command.strip():
+            return []
+        if depth > 10:
+            raise _UnsafeShellSyntax("nested shell command depth exceeds safety limit")
 
-        Handles escaped quotes within strings.
+        source = command.encode()
+        root = Parser(_BASH_LANGUAGE).parse(source).root_node
+        if root.has_error:
+            raise _UnsafeShellSyntax("invalid or unsupported Bash syntax")
 
-        Args:
-            command: The command string to analyze
+        parsed_commands: list[list[_ShellWord]] = []
+        self._collect_command_nodes(root, source, parsed_commands)
 
-        Returns:
-            List of (start, end) tuples for quoted regions
-        """
-        regions = []
-        i = 0
-        while i < len(command):
-            if command[i] in ('"', "'"):
-                quote_char = command[i]
-                start = i
-                i += 1
-                # Find the closing quote, handling escapes
-                while i < len(command):
-                    if command[i] == "\\" and i + 1 < len(command):
-                        # Skip escaped character
-                        i += 2
-                        continue
-                    if command[i] == quote_char:
-                        regions.append((start, i + 1))
-                        break
-                    i += 1
-            i += 1
-        return regions
+        nested_commands: list[list[_ShellWord]] = []
+        for words in parsed_commands:
+            effective = self._effective_command(words)
+            if not effective:
+                continue
 
-    def _in_quoted_region(self, pos: int, regions: list[tuple[int, int]]) -> bool:
-        """Check if a position is inside any quoted region.
+            executable = self._command_basename(effective[0].value)
+            if executable in {"bash", "dash", "ksh", "sh", "zsh"}:
+                script = self._shell_script_argument(effective)
+                if script is not None:
+                    if script.dynamic:
+                        raise _UnsafeShellSyntax(
+                            "dynamic shell -c command cannot be inspected"
+                        )
+                    nested_commands.extend(
+                        self._parse_shell_commands(script.value, depth=depth + 1)
+                    )
+            elif executable == "eval":
+                arguments = effective[1:]
+                if any(argument.dynamic for argument in arguments):
+                    raise _UnsafeShellSyntax(
+                        "dynamic eval command cannot be inspected"
+                    )
+                if arguments:
+                    nested_commands.extend(
+                        self._parse_shell_commands(
+                            " ".join(argument.value for argument in arguments),
+                            depth=depth + 1,
+                        )
+                    )
 
-        Args:
-            pos: Character position to check
-            regions: List of (start, end) quoted regions
+        return parsed_commands + nested_commands
 
-        Returns:
-            True if position is inside a quoted string
-        """
-        for start, end in regions:
-            if start < pos < end:
-                return True
-        return False
+    def _collect_command_nodes(
+        self,
+        node: Node,
+        source: bytes,
+        commands: list[list[_ShellWord]],
+    ) -> None:
+        if node.type == "command":
+            words: list[_ShellWord] = []
+            for child in node.named_children:
+                if child.type in _NON_ARGUMENT_NODES:
+                    continue
+                words.append(self._shell_word(child, source))
+            if words:
+                commands.append(words)
 
-    def _is_in_command_position(self, command: str, idx: int) -> bool:
-        """Check if position is at start of a command.
+        for child in node.named_children:
+            self._collect_command_nodes(child, source, commands)
 
-        A command position is:
-        - Start of the string
-        - After shell operators: ; | && || ( ` $(
-        - Not inside a quoted string
+    def _shell_word(self, node: Node, source: bytes) -> _ShellWord:
+        text = source[node.start_byte : node.end_byte].decode()
+        try:
+            parsed = shlex.split(text)
+        except ValueError as exc:
+            raise _UnsafeShellSyntax(f"cannot inspect shell word: {exc}") from exc
 
-        Args:
-            command: The full command string
-            idx: Position where the pattern was found
+        value = parsed[0] if len(parsed) == 1 else text
+        dynamic = node.type in _DYNAMIC_WORD_NODES or any(
+            descendant.type in _DYNAMIC_WORD_NODES
+            for descendant in self._descendants(node)
+        )
+        return _ShellWord(value=value, dynamic=dynamic)
 
-        Returns:
-            True if this is a command position
-        """
-        # Check quoted regions
-        quoted_regions = self._find_quoted_regions(command)
-        if self._in_quoted_region(idx, quoted_regions):
-            return False
+    def _descendants(self, node: Node) -> list[Node]:
+        descendants: list[Node] = []
+        pending = list(node.named_children)
+        while pending:
+            child = pending.pop()
+            descendants.append(child)
+            pending.extend(child.named_children)
+        return descendants
 
-        # At start of string (after optional whitespace)
-        prefix = command[:idx].strip()
-        if not prefix:
-            return True
+    def _effective_command(
+        self, words: list[_ShellWord]
+    ) -> list[_ShellWord] | None:
+        """Remove command-preserving prefixes and return the invoked command."""
+        remaining = words
+        while remaining:
+            if remaining[0].dynamic:
+                raise _UnsafeShellSyntax("dynamic command name cannot be inspected")
 
-        # Check for command separators before this position
-        # Looking for: ; | && || ( ` $(
-        # Must be the last non-whitespace before idx
+            executable = self._command_basename(remaining[0].value)
+            if executable == "env":
+                remaining = self._unwrap_env(remaining[1:])
+            elif executable == "command":
+                remaining = self._unwrap_command_builtin(remaining[1:])
+            elif executable == "exec":
+                remaining = self._unwrap_exec(remaining[1:])
+            elif executable == "nohup":
+                remaining = self._unwrap_simple_prefix(remaining[1:])
+            elif executable == "time":
+                remaining = self._unwrap_time(remaining[1:])
+            else:
+                return remaining
 
-        # Get the portion before idx and strip trailing whitespace
-        before = command[:idx].rstrip()
-        if not before:
-            return True
+        return None
 
-        # Check what the command portion ends with
-        command_starters = [";", "|", "&&", "||", "(", "`", "$("]
-        for starter in command_starters:
-            if before.endswith(starter):
-                return True
+    def _unwrap_env(self, arguments: list[_ShellWord]) -> list[_ShellWord]:
+        index = 0
+        while index < len(arguments):
+            value = arguments[index].value
+            if value == "--":
+                index += 1
+                break
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", value):
+                index += 1
+                continue
+            if value in {"-S", "--split-string"} or value.startswith(
+                "--split-string="
+            ):
+                raise _UnsafeShellSyntax("env split-string command cannot be inspected")
+            if value in {"-u", "--unset", "-C", "--chdir"}:
+                index += 2
+                continue
+            if value.startswith(("--unset=", "--chdir=")):
+                index += 1
+                continue
+            if value.startswith("-") and value != "-":
+                index += 1
+                continue
+            break
+        return arguments[index:]
 
-        # Also check for | that's not || (pipe)
-        if before.endswith("|") and not before.endswith("||"):
-            return True
+    def _unwrap_command_builtin(
+        self, arguments: list[_ShellWord]
+    ) -> list[_ShellWord]:
+        index = 0
+        while index < len(arguments):
+            value = arguments[index].value
+            if value == "--":
+                index += 1
+                break
+            if value in {"-v", "-V"}:
+                return []
+            if value == "-p":
+                index += 1
+                continue
+            break
+        return arguments[index:]
 
-        return False
+    def _unwrap_exec(self, arguments: list[_ShellWord]) -> list[_ShellWord]:
+        index = 0
+        while index < len(arguments):
+            value = arguments[index].value
+            if value == "--":
+                index += 1
+                break
+            if value == "-a":
+                index += 2
+                continue
+            if value.startswith("-") and value != "-":
+                index += 1
+                continue
+            break
+        return arguments[index:]
 
-    def _check_pattern(self, command: str, pattern: BlockPattern) -> bool:
+    def _unwrap_simple_prefix(
+        self, arguments: list[_ShellWord]
+    ) -> list[_ShellWord]:
+        if arguments and arguments[0].value == "--":
+            return arguments[1:]
+        if arguments and arguments[0].value in {"--help", "--version"}:
+            return []
+        return arguments
+
+    def _unwrap_time(self, arguments: list[_ShellWord]) -> list[_ShellWord]:
+        index = 0
+        while index < len(arguments):
+            value = arguments[index].value
+            if value == "--":
+                index += 1
+                break
+            if value in {"-f", "--format", "-o", "--output"}:
+                index += 2
+                continue
+            if value.startswith(("--format=", "--output=")):
+                index += 1
+                continue
+            if value.startswith("-") and value != "-":
+                index += 1
+                continue
+            break
+        return arguments[index:]
+
+    def _shell_script_argument(
+        self, words: list[_ShellWord]
+    ) -> _ShellWord | None:
+        for index, argument in enumerate(words[1:], start=1):
+            value = argument.value
+            if value == "--":
+                continue
+            if value == "-c" or (
+                value.startswith("-")
+                and not value.startswith("--")
+                and "c" in value[1:]
+            ):
+                if index + 1 >= len(words):
+                    raise _UnsafeShellSyntax("shell -c is missing its command string")
+                return words[index + 1]
+            if not value.startswith("-"):
+                return None
+        return None
+
+    def _check_pattern(
+        self,
+        command: str,
+        pattern: BlockPattern,
+        parsed_commands: list[list[_ShellWord]],
+    ) -> bool:
         """Check if a pattern matches the command using appropriate strategy.
 
         Args:
@@ -435,7 +610,7 @@ class SafetyValidator:
         if pattern.check_type == "substring":
             return self._check_substring(command, pattern.pattern)
         elif pattern.check_type == "command":
-            return self._check_command_position(command, pattern.pattern)
+            return self._check_command_position(parsed_commands, pattern.pattern)
         elif pattern.check_type == "regex":
             return self._check_regex(command, pattern.pattern)
         else:
@@ -454,50 +629,97 @@ class SafetyValidator:
         """
         return pattern.lower() in command.lower()
 
-    def _check_command_position(self, command: str, pattern: str) -> bool:
-        """Check if pattern appears at a command position.
+    def _check_command_position(
+        self, commands: list[list[_ShellWord]], pattern: str
+    ) -> bool:
+        """Match a blocked command against syntax-aware effective commands."""
+        pattern_words = shlex.split(pattern)
+        if not pattern_words:
+            return False
 
-        This is the smart matching that avoids false positives like:
-        - "cd ~/dev/project" should NOT match "/dev/"
-        - "echo 'use sudo'" should NOT match "sudo"
-        - "git commit -m 'rm -rf cleanup'" should NOT match "rm -rf"
+        for words in commands:
+            effective = self._effective_command(words)
+            if not effective:
+                continue
 
-        Args:
-            command: The command to check
-            pattern: The command pattern to match
+            if pattern_words[0] == "rm" and len(pattern_words) == 3:
+                if self._matches_dangerous_rm(effective, pattern_words[2]):
+                    return True
+                continue
 
-        Returns:
-            True if pattern is found at a command position
-        """
-        command_lower = command.lower()
-        pattern_lower = pattern.lower()
+            if len(effective) < len(pattern_words):
+                continue
 
-        # Find all occurrences
-        start = 0
-        while True:
-            idx = command_lower.find(pattern_lower, start)
-            if idx == -1:
-                break
+            actual_executable = self._command_basename(effective[0].value)
+            expected_executable = self._command_basename(pattern_words[0])
+            executable_matches = actual_executable == expected_executable
+            if expected_executable == "mkfs":
+                executable_matches = executable_matches or actual_executable.startswith(
+                    "mkfs."
+                )
+            if not executable_matches:
+                continue
 
-            # Check if this occurrence is at a command position
-            if self._is_in_command_position(command, idx):
-                # Additional check: ensure it's at a word boundary for path patterns
-                # This prevents "~/dev/project" from matching when looking for "/dev/" redirect
-                if "/" in pattern:
-                    # For path-containing patterns, verify it's not part of a longer path
-                    # Check character before idx (should be whitespace or operator)
-                    if idx > 0:
-                        char_before = command[idx - 1]
-                        if char_before not in " \t;|&()>`":
-                            # Part of a longer token, not a command position match
-                            start = idx + 1
-                            continue
-
+            actual_arguments = [
+                word.value.lower() for word in effective[1 : len(pattern_words)]
+            ]
+            expected_arguments = [word.lower() for word in pattern_words[1:]]
+            if actual_arguments == expected_arguments:
                 return True
 
-            start = idx + 1
-
         return False
+
+    def _matches_dangerous_rm(
+        self, words: list[_ShellWord], blocked_target: str
+    ) -> bool:
+        if self._command_basename(words[0].value) != "rm":
+            return False
+
+        recursive = False
+        force = False
+        operands: list[str] = []
+        options_ended = False
+        for word in words[1:]:
+            value = word.value
+            if not options_ended and value == "--":
+                options_ended = True
+                continue
+            if not options_ended and value.startswith("--"):
+                option = value.split("=", 1)[0]
+                recursive = recursive or option == "--recursive"
+                force = force or option == "--force"
+                continue
+            if not options_ended and value.startswith("-") and value != "-":
+                flags = value[1:]
+                recursive = recursive or "r" in flags or "R" in flags
+                force = force or "f" in flags
+                continue
+            operands.append(value)
+
+        if not (recursive and force):
+            return False
+        if blocked_target == "/":
+            return any(self._is_root_path(operand) for operand in operands)
+        if blocked_target == "~":
+            return any(self._is_home_path(operand) for operand in operands)
+        return False
+
+    def _is_root_path(self, value: str) -> bool:
+        if not value.startswith("/"):
+            return False
+        return posixpath.normpath("/" + value.lstrip("/")) == "/"
+
+    def _is_home_path(self, value: str) -> bool:
+        for prefix in ("~", "$HOME", "${HOME}"):
+            if value == prefix:
+                return True
+            if value.startswith(prefix + "/"):
+                suffix = value[len(prefix) + 1 :]
+                return posixpath.normpath(suffix or ".") == "."
+        return False
+
+    def _command_basename(self, value: str) -> str:
+        return value.rsplit("/", 1)[-1].lower()
 
     def _check_regex(self, command: str, pattern: str) -> bool:
         """Check if regex pattern matches the command.
