@@ -9,7 +9,9 @@ Tests cover:
 """
 
 import pytest
+from unittest.mock import AsyncMock, patch
 
+from amplifier_module_tool_bash import BashTool
 from amplifier_module_tool_bash.safety import (
     SafetyConfig,
     SafetyResult,
@@ -18,6 +20,32 @@ from amplifier_module_tool_bash.safety import (
 
 # Note: BlockPattern and SafetyProfile are not directly used in tests
 # but are tested indirectly through SafetyValidator
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -o posix -c 'rm -rf /'",
+        "bash +x -c 'rm -rf /'",
+        "bash -O extglob -c 'rm -rf /'",
+        "bash --rcfile ignored -c 'rm -rf /'",
+        "$'rm' -rf /",
+        "rm -rf $'/'",
+        'rm -rf $"/"',
+        "env <<< x rm -rf /",
+    ],
+)
+def test_bash_specific_syntax_cannot_hide_a_blocked_command(command):
+    # Validator-only: never execute destructive test strings.
+    assert not SafetyValidator(profile="strict").validate(command).allowed
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["echo $'hello'", "bash -o pipefail -c 'printf ok'", "env <<< x printf ok"],
+)
+def test_supported_safe_commands_remain_allowed(command):
+    assert SafetyValidator(profile="strict").validate(command).allowed
 
 
 class TestSafetyProfiles:
@@ -188,6 +216,83 @@ class TestFalsePositivePrevention:
         for cmd in dangerous_commands:
             result = validator.validate(cmd)
             assert not result.allowed, f"Sudo command should be blocked: {cmd}"
+
+    @pytest.mark.parametrize("profile", ["strict", "standard"])
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo ok\nsudo --help",
+            "echo ok\r\nsudo --help",
+            "true & sudo --help",
+            "env sudo --help",
+            "env -i sudo --help",
+            "exec sudo --help",
+            "time sudo --help",
+            "time -p sudo --help",
+            "command sudo --help",
+            "nohup sudo --help",
+            "X=1 sudo --help",
+            "echo $(env sudo --help)",
+            "{ env sudo --help; }",
+            "if true; then env sudo --help; fi",
+            "bash -c 'sudo --help'",
+            "eval 'sudo --help'",
+            "echo ok\nmkfs --help",
+            "/usr/sbin/mkfs.ext4 --help",
+            "rm -r -f /",
+            "rm -f -r /",
+            "rm --recursive --force /",
+            "rm --force --recursive /",
+            "rm -rf -- /",
+            "env rm -r -f /",
+        ],
+    )
+    def test_rejects_syntax_and_wrapper_bypasses(self, profile, command):
+        validator = SafetyValidator(profile=profile)
+        result = validator.validate(command)
+        assert not result.allowed, f"{profile} should block: {command}"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "printf '%s\n' 'sudo --help'",
+            "grep sudo README.md",
+            "git commit -m 'rm -r -f / is dangerous'",
+            "printf '%s\n' 'env sudo --help'",
+            "rm -r -f ./build",
+        ],
+    )
+    def test_syntax_aware_checks_avoid_data_false_positives(self, command):
+        validator = SafetyValidator(profile="strict")
+        assert validator.validate(command).allowed
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "rm -r -f ~",
+            "rm --recursive --force ~/",
+            "rm -fr $HOME",
+            "rm -rf ${HOME}/.",
+        ],
+    )
+    def test_strict_rejects_normalized_home_deletion(self, command):
+        validator = SafetyValidator(profile="strict")
+        assert not validator.validate(command).allowed
+
+    @pytest.mark.parametrize("profile", ["strict", "standard", "permissive"])
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "rm -r -f /",
+            "rm --force --recursive /",
+            "env rm -rf -- /",
+        ],
+    )
+    def test_all_restricted_profiles_reject_normalized_root_deletion(
+        self, profile, command
+    ):
+        validator = SafetyValidator(profile=profile)
+        assert not validator.validate(command).allowed
 
 
 class TestAllowlistOverrides:
@@ -416,3 +521,37 @@ class TestPatternTypes:
 
         result = validator.validate("cat file > /dev/null")
         assert result.allowed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo ok\nsudo --help",
+        "true & sudo --help",
+        "env sudo --help",
+        "rm --recursive --force /",
+    ],
+)
+@pytest.mark.parametrize("run_in_background", [False, True])
+async def test_bash_tool_never_executes_safety_bypasses(
+    command, run_in_background
+):
+    tool = BashTool({"safety_profile": "strict"})
+
+    with (
+        patch.object(tool, "_run_command", new_callable=AsyncMock) as foreground,
+        patch.object(
+            tool, "_run_command_background", new_callable=AsyncMock
+        ) as background,
+    ):
+        result = await tool.execute(
+            {
+                "command": command,
+                "run_in_background": run_in_background,
+            }
+        )
+
+    assert not result.success
+    foreground.assert_not_awaited()
+    background.assert_not_awaited()
