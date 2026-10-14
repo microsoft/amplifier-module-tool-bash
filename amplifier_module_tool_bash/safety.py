@@ -44,6 +44,7 @@ _NON_ARGUMENT_NODES = {
     "comment",
     "file_redirect",
     "heredoc_redirect",
+    "herestring_redirect",
     "variable_assignment",
 }
 
@@ -52,6 +53,7 @@ _NON_ARGUMENT_NODES = {
 class _ShellWord:
     value: str
     dynamic: bool = False
+    opaque_quoting: bool = False
 
 
 class _UnsafeShellSyntax(ValueError):
@@ -450,7 +452,14 @@ class SafetyValidator:
             descendant.type in _DYNAMIC_WORD_NODES
             for descendant in self._descendants(node)
         )
-        return _ShellWord(value=value, dynamic=dynamic)
+        # shlex does not decode Bash's ANSI-C or locale-translated strings.
+        # Keep ordinary data arguments usable, but never compare these spellings
+        # as executable names, wrapper options, or deletion targets.
+        opaque_quoting = any(
+            source[part.start_byte : part.start_byte + 2] in (b"$'", b'$"')
+            for part in (node, *self._descendants(node))
+        )
+        return _ShellWord(value=value, dynamic=dynamic, opaque_quoting=opaque_quoting)
 
     def _descendants(self, node: Node) -> list[Node]:
         descendants: list[Node] = []
@@ -467,10 +476,16 @@ class SafetyValidator:
         """Remove command-preserving prefixes and return the invoked command."""
         remaining = words
         while remaining:
-            if remaining[0].dynamic:
+            if remaining[0].dynamic or remaining[0].opaque_quoting:
                 raise _UnsafeShellSyntax("dynamic command name cannot be inspected")
 
             executable = self._command_basename(remaining[0].value)
+            if executable in {"rm", "env", "command", "exec", "nohup", "time"} and any(
+                word.opaque_quoting for word in remaining[1:]
+            ):
+                raise _UnsafeShellSyntax(
+                    "Bash-specific quoted command arguments cannot be inspected"
+                )
             if executable == "env":
                 remaining = self._unwrap_env(remaining[1:])
             elif executable == "command":
@@ -576,10 +591,25 @@ class SafetyValidator:
     def _shell_script_argument(
         self, words: list[_ShellWord]
     ) -> _ShellWord | None:
-        for index, argument in enumerate(words[1:], start=1):
+        index = 1
+        while index < len(words):
+            argument = words[index]
             value = argument.value
             if value == "--":
+                return None
+            if value in {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}:
+                if index + 1 >= len(words):
+                    raise _UnsafeShellSyntax("shell option is missing its value")
+                index += 2
                 continue
+            if (
+                value.startswith(("-", "+"))
+                and not value.startswith("--")
+                and any(flag in value[1:] for flag in ("o", "O"))
+            ):
+                raise _UnsafeShellSyntax(
+                    "combined shell option with a value cannot be inspected"
+                )
             if value == "-c" or (
                 value.startswith("-")
                 and not value.startswith("--")
@@ -588,8 +618,9 @@ class SafetyValidator:
                 if index + 1 >= len(words):
                     raise _UnsafeShellSyntax("shell -c is missing its command string")
                 return words[index + 1]
-            if not value.startswith("-"):
+            if not value.startswith(("-", "+")):
                 return None
+            index += 1
         return None
 
     def _check_pattern(

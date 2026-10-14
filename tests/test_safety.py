@@ -22,6 +22,32 @@ from amplifier_module_tool_bash.safety import (
 # but are tested indirectly through SafetyValidator
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "bash -o posix -c 'rm -rf /'",
+        "bash +x -c 'rm -rf /'",
+        "bash -O extglob -c 'rm -rf /'",
+        "bash --rcfile ignored -c 'rm -rf /'",
+        "$'rm' -rf /",
+        "rm -rf $'/'",
+        'rm -rf $"/"',
+        "env <<< x rm -rf /",
+    ],
+)
+def test_bash_specific_syntax_cannot_hide_a_blocked_command(command):
+    # Validator-only: never execute destructive test strings.
+    assert not SafetyValidator(profile="strict").validate(command).allowed
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["echo $'hello'", "bash -o pipefail -c 'printf ok'", "env <<< x printf ok"],
+)
+def test_supported_safe_commands_remain_allowed(command):
+    assert SafetyValidator(profile="strict").validate(command).allowed
+
+
 class TestSafetyProfiles:
     """Test predefined safety profiles."""
 
