@@ -207,6 +207,12 @@ The bash tool uses a profile-based safety system with smart pattern matching.
 
 The safety system distinguishes between actual commands and text in strings/paths:
 
+Restricted profiles inspect the command invoked through `nice`, `setsid`, and
+`stdbuf`, including nested wrappers and their supported options. Dynamic or
+unrecognized options on these wrappers are rejected when the invoked command
+cannot be determined. This is command inspection, not an execution sandbox;
+the existing explicit allowlist and unrestricted-profile behavior still apply.
+
 ```bash
 # ✅ ALLOWED - "sudo" is in a quoted string, not a command
 echo "use sudo for admin tasks"

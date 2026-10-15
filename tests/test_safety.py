@@ -22,6 +22,65 @@ from amplifier_module_tool_bash.safety import (
 # but are tested indirectly through SafetyValidator
 
 
+@pytest.mark.parametrize("profile", ["strict", "standard", "permissive"])
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "nice",
+        "nice -n 10",
+        "nice -n-3",
+        "nice --adjustment=10",
+        "nice --adjustment -3",
+        "nice -10 --",
+        "/usr/bin/nice --",
+        "setsid",
+        "setsid -fw",
+        "setsid --fork --wait --",
+        "stdbuf -oL",
+        "stdbuf -i 0 -o L -e0",
+        "stdbuf --output=L --",
+        "env X=1 nice -n 5 setsid -f stdbuf -oL",
+    ],
+)
+def test_execution_wrappers_preserve_safety_checks(profile, prefix):
+    # Validator strings only: no destructive command is ever executed.
+    validator = SafetyValidator(profile=profile)
+    assert not validator.validate(f"{prefix} rm -rf /").allowed
+    assert not validator.validate(f"{prefix} sh -c 'rm -rf /'").allowed
+    assert validator.validate(f"{prefix} printf '%s' 'rm -rf /'").allowed
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "nice -n $ADJUSTMENT rm -rf /",
+        "nice $OPTIONS rm -rf /",
+        "setsid $OPTIONS rm -rf /",
+        "stdbuf -o $MODE rm -rf /",
+        "nice --unknown rm -rf /",
+        "setsid --unknown rm -rf /",
+        "stdbuf --unknown rm -rf /",
+        "nice -n",
+        "stdbuf -o",
+    ],
+)
+def test_execution_wrapper_ambiguity_fails_closed(command):
+    assert not SafetyValidator().validate(command).allowed
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "nice",
+        "nice --help rm -rf /",
+        "setsid --version rm -rf /",
+        "stdbuf --help rm -rf /",
+    ],
+)
+def test_execution_wrapper_non_execution_forms_remain_usable(command):
+    assert SafetyValidator().validate(command).allowed
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -530,6 +589,9 @@ class TestPatternTypes:
         "echo ok\nsudo --help",
         "true & sudo --help",
         "env sudo --help",
+        "nice -n 10 rm -rf /",
+        "setsid -fw rm -rf /",
+        "stdbuf -oL rm -rf /",
         "rm --recursive --force /",
     ],
 )
