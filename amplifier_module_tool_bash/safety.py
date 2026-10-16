@@ -496,10 +496,77 @@ class SafetyValidator:
                 remaining = self._unwrap_simple_prefix(remaining[1:])
             elif executable == "time":
                 remaining = self._unwrap_time(remaining[1:])
+            elif executable in {"nice", "setsid", "stdbuf"}:
+                remaining = self._unwrap_execution_wrapper(executable, remaining[1:])
             else:
                 return remaining
 
         return None
+
+    def _unwrap_execution_wrapper(
+        self, executable: str, arguments: list[_ShellWord]
+    ) -> list[_ShellWord]:
+        """Inspect argv-preserving wrappers without guessing unknown options.
+
+        Dynamic options could expand into multiple words or change where the
+        invoked command starts, so restricted profiles reject that ambiguity.
+        Literal data after the executable remains subject to its usual rules.
+        """
+        index = 0
+        while index < len(arguments):
+            argument = arguments[index]
+            if argument.dynamic or argument.opaque_quoting:
+                raise _UnsafeShellSyntax(f"dynamic {executable} option or command")
+            value = argument.value
+            if value == "--":
+                return arguments[index + 1 :]
+            if value in {"--help", "--version"}:
+                return []
+            if not value.startswith("-") or value == "-":
+                return arguments[index:]
+
+            takes_value = False
+            if executable == "nice":
+                takes_value = value in {"-n", "--adjustment"}
+                attached = (
+                    value.startswith("--adjustment=")
+                    or value.startswith("-n")
+                    and len(value) > 2
+                    or re.fullmatch(r"-\d+", value) is not None
+                )
+                known = takes_value or attached
+            elif executable == "setsid":
+                known = value in {"--ctty", "--fork", "--wait"} or (
+                    value.startswith("-")
+                    and not value.startswith("--")
+                    and len(value) > 1
+                    and set(value[1:]) <= set("cfw")
+                )
+            else:  # stdbuf: every short option consumes a buffering mode.
+                takes_value = value in {
+                    "-i",
+                    "-o",
+                    "-e",
+                    "--input",
+                    "--output",
+                    "--error",
+                }
+                attached = value.startswith(("--input=", "--output=", "--error=")) or (
+                    len(value) > 2 and value[:2] in {"-i", "-o", "-e"}
+                )
+                known = takes_value or attached
+            if not known:
+                raise _UnsafeShellSyntax(f"unsupported {executable} option: {value}")
+            if takes_value:
+                index += 1
+                if index >= len(arguments):
+                    raise _UnsafeShellSyntax(
+                        f"{executable} option is missing its value"
+                    )
+                if arguments[index].dynamic or arguments[index].opaque_quoting:
+                    raise _UnsafeShellSyntax(f"dynamic {executable} option value")
+            index += 1
+        return []
 
     def _unwrap_env(self, arguments: list[_ShellWord]) -> list[_ShellWord]:
         index = 0
