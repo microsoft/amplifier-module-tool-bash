@@ -54,6 +54,34 @@ def text(result, stream="stdout"):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["run", "start"])
+async def test_documented_literal_executable_with_variable_data(tmp_path, mode):
+    """The advertised example executes with unchanged strict validation."""
+    binary = tmp_path / ".venv" / "bin"
+    binary.mkdir(parents=True)
+    launcher = binary / "python"
+    launcher.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n')
+    launcher.chmod(0o755)
+    tests = tmp_path / "tests" / "unit"
+    tests.mkdir(parents=True)
+    (tests / "test_example.py").write_text("def test_example():\n    assert True\n")
+    tool = BashTool({"managed_processes": True, "working_dir": str(tmp_path)})
+    try:
+        command = tool.description.split("- Example: `", 1)[1].split("`", 1)[0]
+        result = await action(tool, mode, command=command)
+        if mode == "start":
+            result = await finished(tool, result["process_id"])
+            assert result["state"] == "completed"
+            output = text(result)
+        else:
+            output = result["stdout"]
+        assert result["returncode"] == 0
+        assert "1 passed" in output
+    finally:
+        await tool.close()
+
+
+@pytest.mark.asyncio
 async def test_incremental_output_stdin_eof_and_real_exit_code(tool):
     started = await action(
         tool,
