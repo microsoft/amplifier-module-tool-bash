@@ -430,6 +430,12 @@ async def test_managed_start_uses_same_shell_validator():
         # in test_safety.py. Keep these pipe/PTY seams strictly non-executing.
         'rm -rf "$SYNTHETIC"',
         "sh -c $'printf ok'",
+        'echo "$' + chr(92) + chr(10) + '(printf SYNTHETIC_MARKER)"',
+        "cat <<EOF\nprefix $" + chr(92) + chr(10) + "(printf SYNTHETIC_MARKER)\nEOF\n",
+        "echo ${X:-$" + chr(92) + chr(10) + "(printf SYNTHETIC_MARKER)}",
+        "cat <<EOF\n${X:-$" + chr(92) + chr(10) + "(printf SYNTHETIC_MARKER)}\nEOF\n",
+        "[[ x =~ $" + chr(92) + chr(10) + "(printf SYNTHETIC_MARKER) ]]",
+        "[[ x =~ $'a" + chr(92) + "'b'$" + chr(92) + chr(10) + "(printf SYNTHETIC_MARKER) ]]",
     ],
 )
 @pytest.mark.parametrize("pty", [False, True])

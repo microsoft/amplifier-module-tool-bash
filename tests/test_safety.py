@@ -34,6 +34,291 @@ _SYNTAX_HINT = (
 _INVALID_SCRIPT = "if true; then printf synthetic"
 _MULTIPLE_HEREDOCS = "cat <<'LEFT' <<'RIGHT'\none\nLEFT\ntwo\nRIGHT\n"
 _WORD_DECODER_SCRIPT = '''printf '%s' "$(printf "'")"'''
+_CONTINUED_SUBSTITUTION = "$" + chr(92) + chr(10) + "(printf SYNTHETIC_MARKER)"
+_CONTINUED_PARAMETER_OPERAND = "${SYNTHETIC_UNSET:-" + _CONTINUED_SUBSTITUTION + "}"
+_CONTINUED_REGEX = "[[ x =~ " + _CONTINUED_SUBSTITUTION + " ]]"
+_ANSI_REGEX_PREFIX = "$'a" + chr(92) + "'b'"
+_CONTINUED_ANSI_REGEX = "[[ x =~ " + _ANSI_REGEX_PREFIX + _CONTINUED_SUBSTITUTION + " ]]"
+
+
+class TestContinuedExpansion:
+    """Harmless validator inputs only; never execute these scripts in a shell."""
+
+    continuation = chr(92) + chr(10)
+    split_substitution = _CONTINUED_SUBSTITUTION
+
+    @pytest.mark.parametrize("profile", ["strict", "standard", "permissive"])
+    @pytest.mark.parametrize("count", [1, 2, 3])
+    @pytest.mark.parametrize(
+        "expansion", ["(printf SYNTHETIC_MARKER)", "{X}", "{X:-$(printf SYNTHETIC_MARKER)}"]
+    )
+    @pytest.mark.parametrize("context", ["quoted", "heredoc"])
+    def test_split_introducers_fail_closed(self, profile, count, expansion, context):
+        argument = "$" + self.continuation * count + expansion
+        command = (
+            'echo "' + argument + '"'
+            if context == "quoted"
+            else "cat <<EOF\n" + argument + "\nEOF\n"
+        )
+        result = SafetyValidator(profile=profile).validate(command)
+        assert not result.allowed
+        assert result.matched_pattern == "<unsupported bash syntax>"
+        assert "stage=continuation_expansion, scope=top_level, depth=0" in result.reason
+        assert result.hint == _SYNTAX_HINT
+        assert "SYNTHETIC_MARKER" not in result.reason
+
+    @pytest.mark.parametrize("profile", ["strict", "standard", "permissive"])
+    @pytest.mark.parametrize("prefix", ["prefix ", "  ", "first line\nprefix "])
+    def test_active_heredoc_literal_prefix_does_not_hide_dollar(self, profile, prefix):
+        command = "cat <<EOF\n" + prefix + self.split_substitution + "\nEOF\n"
+        result = SafetyValidator(profile=profile).validate(command)
+        assert not result.allowed
+        assert "stage=continuation_expansion" in result.reason
+
+    @pytest.mark.parametrize("profile", ["strict", "standard", "permissive"])
+    @pytest.mark.parametrize("count", [1, 2, 3])
+    @pytest.mark.parametrize("tail", ["(printf SYNTHETIC_MARKER)", "{SYNTHETIC_VAR}"])
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "echo ${{X:-{}}}",
+            "echo ${{X:-${{Y:-{}}}}}",
+            "echo ${{X/a/{}}}",
+            "echo ${{X//{}/b}}",
+            "echo ${{X#{}}}",
+            "echo ${{X%{}}}",
+            'echo ${{X:-"{}"}}',
+            'echo "${{X:-"{}"}}"',
+            'echo "${{X:-{}}}"',
+            'echo "${{X:-\'{}\'}}"',
+            'echo "${{X:-$\'{}\'}}"',
+            "cat <<EOF\n${{X:-{}}}\nEOF\n",
+            "cat <<EOF\nprefix ${{X:-'{}'}}\nEOF\n",
+        ],
+    )
+    def test_parameter_operand_fallbacks_are_guarded(
+        self, profile, count, tail, template
+    ):
+        command = template.format("$" + self.continuation * count + tail)
+        result = SafetyValidator(profile=profile).validate(command)
+        assert not result.allowed
+        assert "stage=continuation_expansion" in result.reason
+        assert result.hint == _SYNTAX_HINT
+        assert "SYNTHETIC_MARKER" not in result.reason
+
+    @pytest.mark.parametrize("profile", ["strict", "standard", "permissive"])
+    @pytest.mark.parametrize(
+        "template", ["[[ x =~ {} ]]", '[[ x =~ "{}" ]]', "[[ x =~ 'prefix'{} ]]"]
+    )
+    def test_opaque_regex_introducer_is_guarded(self, profile, template):
+        result = SafetyValidator(profile=profile).validate(
+            template.format(self.split_substitution)
+        )
+        assert not result.allowed
+        assert "stage=continuation_expansion" in result.reason
+        assert result.hint == _SYNTAX_HINT
+
+    @pytest.mark.parametrize(
+        "template",
+        ["[[ x =~ '{}' ]]", "[[ x =~ \\{} ]]", '[[ x =~ "\\{}" ]]'],
+    )
+    def test_opaque_regex_literal_dollar_remains_allowed(self, template):
+        assert SafetyValidator().validate(
+            template.format(self.split_substitution)
+        ).allowed
+
+    @pytest.mark.parametrize("separated", [False, True])
+    def test_opaque_regex_pid_expansion_remains_allowed(self, separated):
+        dollars = "$" + (self.continuation if separated else "") + "$"
+        command = "[[ x =~ " + dollars + self.continuation + "(literal) ]]"
+        assert SafetyValidator().validate(command).allowed
+
+    @pytest.mark.parametrize("profile", ["strict", "standard", "permissive"])
+    @pytest.mark.parametrize("continued_prefix", [False, True])
+    def test_ansi_regex_quote_escape_does_not_hide_active_dollar(
+        self, profile, continued_prefix
+    ):
+        prefix = _ANSI_REGEX_PREFIX
+        if continued_prefix:
+            prefix = "$" + self.continuation + prefix[1:]
+        command = "[[ x =~ " + prefix + self.split_substitution + " ]]"
+        result = SafetyValidator(profile=profile).validate(command)
+        assert not result.allowed
+        assert "stage=continuation_expansion" in result.reason
+        assert result.hint == _SYNTAX_HINT
+
+    @pytest.mark.parametrize("profile", ["strict", "standard", "permissive"])
+    @pytest.mark.parametrize("include_split", [False, True])
+    def test_ansi_regex_escaped_quote_retains_literal_content(self, profile, include_split):
+        content = _ANSI_REGEX_PREFIX[:-1]
+        if include_split:
+            content += self.split_substitution
+        command = "[[ x =~ " + content + "' ]]"
+        assert SafetyValidator(profile=profile).validate(command).allowed
+
+    @pytest.mark.parametrize("context", ["bare", "outer_string", "heredoc"])
+    def test_nested_command_resets_inherited_parameter_quote_context(self, context):
+        literal = "${X:-'" + self.split_substitution + "'}"
+        inner = "$(echo " + literal + ")"
+        command = {
+            "bare": "echo " + literal,
+            "outer_string": 'echo "' + inner + '"',
+            "heredoc": "cat <<EOF\n" + inner + "\nEOF\n",
+        }[context]
+        assert SafetyValidator().validate(command).allowed
+
+    @pytest.mark.parametrize("context", ["bare", "outer_string", "heredoc"])
+    @pytest.mark.parametrize("separated", [False, True])
+    def test_parameter_pid_operand_remains_literal(self, context, separated):
+        dollars = "$" + (self.continuation if separated else "") + "$"
+        operand = "${X:-" + dollars + self.continuation + "(literal)}"
+        command = {
+            "bare": "echo " + operand,
+            "outer_string": 'echo "' + operand + '"',
+            "heredoc": "cat <<EOF\n" + operand + "\nEOF\n",
+        }[context]
+        assert SafetyValidator().validate(command).allowed
+
+    def test_unquoted_parameter_ansi_c_operand_remains_literal(self):
+        command = "echo ${X:-$'" + self.split_substitution + "'}"
+        assert SafetyValidator().validate(command).allowed
+
+    def test_escaped_dollar_operand_does_not_gain_a_continuation_refusal(self):
+        command = "echo ${X:-\\" + self.split_substitution + "}"
+        result = SafetyValidator().validate(command)
+        assert "stage=continuation_expansion" not in (result.reason or "")
+
+    def test_parameter_operand_coordinates_are_preserved(self):
+        command = "echo é" + _CONTINUED_PARAMETER_OPERAND
+        result = SafetyValidator().validate(command)
+        column = command.encode().rindex(b"$") + 1
+        assert not result.allowed
+        assert f"line 1, byte column {column}" in result.reason
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            'echo "{}"',
+            '"{}"',
+            'env A="{}" echo ok',
+            'nice -n "{}" echo ok',
+            'echo "$(echo "{}")"',
+            'echo "${{X:-"{}"}}"',
+            'echo ok >"{}"',
+        ],
+    )
+    def test_walk_reaches_nested_and_control_positions(self, template):
+        result = SafetyValidator().validate(template.format(self.split_substitution))
+        assert not result.allowed
+        assert "stage=continuation_expansion" in result.reason
+
+    @pytest.mark.parametrize("prefix,scope", [("sh -c ", "shell_c"), ("eval ", "eval")])
+    def test_decoded_script_scopes_are_guarded(self, prefix, scope):
+        script = 'echo "' + self.split_substitution + '"'
+        result = SafetyValidator().validate(prefix + shlex.quote(script))
+        assert not result.allowed
+        assert f"stage=continuation_expansion, scope={scope}, depth=1" in result.reason
+
+    def test_original_source_coordinates_are_preserved(self):
+        script = 'echo "é' + self.split_substitution + '"'
+        result = SafetyValidator().validate(script)
+        column = script.encode().index(b"$") + 1
+        assert not result.allowed
+        assert f"line 1, byte column {column}" in result.reason
+
+    @pytest.mark.parametrize(
+        "argument",
+        [
+            "'{}'",
+            '"\\{}"',
+            "$'{}'",
+        ],
+    )
+    def test_literal_dollars_are_not_active_tokens(self, argument):
+        command = "echo " + argument.format(self.split_substitution)
+        assert SafetyValidator().validate(command).allowed
+
+    @pytest.mark.parametrize(
+        "delimiter,end",
+        [
+            ("'EOF'", "EOF"),
+            ('"EOF"', "EOF"),
+            ("\\EOF", "EOF"),
+            ("E\\OF", "EOF"),
+        ],
+    )
+    def test_quoted_heredoc_data_remains_literal(self, delimiter, end):
+        command = "cat <<" + delimiter + "\n" + self.split_substitution + "\n" + end + "\n"
+        assert SafetyValidator().validate(command).allowed
+
+    @pytest.mark.parametrize("delimiter", ["E'OF'", 'E"OF"'])
+    def test_partial_quote_parser_limit_is_not_a_new_guard_refusal(self, delimiter):
+        command = "cat <<" + delimiter + "\n" + self.split_substitution + "\nEOF\n"
+        root = safety_module.Parser(safety_module._BASH_LANGUAGE).parse(
+            command.encode()
+        ).root_node
+        result = SafetyValidator().validate(command)
+        if root.has_error:
+            # Existing grammar failure remains closed; no partial-parse fallback.
+            assert not result.allowed
+            assert "stage=tree_parse" in result.reason
+        else:
+            assert result.allowed
+
+    @pytest.mark.parametrize("slashes", [1, 3])
+    def test_escaped_dollar_in_active_heredoc_is_literal(self, slashes):
+        command = (
+            "cat <<EOF\nprefix " + chr(92) * slashes
+            + self.split_substitution + "\nEOF\n"
+        )
+        assert SafetyValidator().validate(command).allowed
+
+    def test_quoted_heredoc_does_not_suppress_guard_elsewhere(self):
+        literal = "cat <<E\\OF\n" + self.split_substitution + "\nEOF\n"
+        command = literal + 'echo "' + self.split_substitution + '"'
+        result = SafetyValidator().validate(command)
+        assert not result.allowed
+        assert "stage=continuation_expansion" in result.reason
+
+    def test_known_heredoc_substitution_retains_its_own_literal_quote_context(self):
+        literal = "'" + self.split_substitution + "'"
+        command = "cat <<EOF\n$(echo " + literal + ")\nEOF\n"
+        assert SafetyValidator().validate(command).allowed
+
+    @pytest.mark.parametrize("prefix", ["", "prefix "])
+    @pytest.mark.parametrize("suffix", ["(literal)", "{literal}"])
+    def test_heredoc_pid_expansion_does_not_reuse_its_second_dollar(self, prefix, suffix):
+        command = "cat <<EOF\n" + prefix + "$$" + self.continuation + suffix + "\nEOF\n"
+        assert SafetyValidator().validate(command).allowed
+
+    def test_comments_and_ordinary_continued_data_remain_allowed(self):
+        commands = [
+            "# " + self.split_substitution + "\necho ok",
+            'echo "a' + self.continuation + 'b"',
+            'echo "$' + self.continuation + 'HOME"',
+            'echo "$' + self.continuation + '"',
+            'echo "$' + self.continuation + ' (literal)"',
+            'echo "$"',
+        ]
+        for command in commands:
+            assert SafetyValidator().validate(command).allowed
+
+    def test_even_backslashes_leave_dollar_active(self):
+        command = 'echo "' + chr(92) * 2 + self.split_substitution + '"'
+        result = SafetyValidator().validate(command)
+        assert not result.allowed
+        assert "stage=continuation_expansion" in result.reason
+
+    def test_unquoted_split_introducer_is_already_refused(self):
+        result = SafetyValidator().validate("echo " + self.split_substitution)
+        assert not result.allowed
+        assert result.matched_pattern == "<unsupported bash syntax>"
+
+    def test_explicit_profile_bypasses_keep_existing_behavior(self):
+        command = 'echo "' + self.split_substitution + '"'
+        assert SafetyValidator(profile="unrestricted").validate(command).allowed
+        config = SafetyConfig(profile="standard", allowed_commands=[command])
+        assert SafetyValidator(profile="standard", config=config).validate(command).allowed
 
 
 class TestSemanticShellWords:
@@ -663,7 +948,18 @@ class TestSyntaxDiagnostics:
 @pytest.mark.parametrize(
     # The nested-quote fixture is now positive and must never enter this seam.
     "command",
-    [_INVALID_SCRIPT, _MULTIPLE_HEREDOCS, 'rm -rf "$SYNTHETIC"', "sh -c $'printf ok'"],
+    [
+        _INVALID_SCRIPT,
+        _MULTIPLE_HEREDOCS,
+        'rm -rf "$SYNTHETIC"',
+        "sh -c $'printf ok'",
+        'echo "' + _CONTINUED_SUBSTITUTION + '"',
+        "cat <<EOF\nprefix " + _CONTINUED_SUBSTITUTION + "\nEOF\n",
+        "echo " + _CONTINUED_PARAMETER_OPERAND,
+        "cat <<EOF\nprefix " + _CONTINUED_PARAMETER_OPERAND + "\nEOF\n",
+        _CONTINUED_REGEX,
+        _CONTINUED_ANSI_REGEX,
+    ],
 )
 @pytest.mark.parametrize("run_in_background", [False, True])
 async def test_syntax_diagnostics_never_reach_ordinary_subprocess_seams(

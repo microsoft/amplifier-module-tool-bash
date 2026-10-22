@@ -434,6 +434,15 @@ class SafetyValidator:
                 pass
             raise failure
 
+        continued = self._find_continued_expansion(root, source)
+        if continued is not None:
+            raise _UnsafeShellSyntax(
+                "continuation-split expansion cannot be inspected",
+                stage="continuation_expansion", scope=scope, depth=depth,
+                line=source.count(b"\n", 0, continued) + 1,
+                byte_column=continued - source.rfind(b"\n", 0, continued),
+            )
+
         parsed_commands: list[list[_ShellWord]] = []
         self._collect_command_nodes(
             root, source, parsed_commands, scope=scope, depth=depth
@@ -472,6 +481,159 @@ class SafetyValidator:
                     )
 
         return parsed_commands + nested_commands
+
+    def _find_continued_expansion(self, root: Node, source: bytes) -> int | None:
+        """Refuse split expansion introducers the grammar can classify as data.
+
+        Inspect raw token boundaries before literal decoding removes escapes.
+        Quoted/escaped dollars in lexical content are not active dollar tokens.
+        Walk independently of word decoding, including beneath dynamic parents.
+        """
+        def split_at(offset: int, end: int) -> bool:
+            cursor = offset + 1
+            while cursor + 2 <= end and source[cursor : cursor + 2] == b"\\\n":
+                cursor += 2
+            return (
+                cursor > offset + 1
+                and cursor < end
+                and source[cursor : cursor + 1] in {b"(", b"{"}
+            )
+
+        def scan_range(
+            start: int, end: int, *, lexical_quotes: bool = False
+        ) -> int | None:
+            cursor = start
+            quote = None
+            while cursor < end:
+                char = source[cursor : cursor + 1]
+                if lexical_quotes and quote in {b"'", b"$'"}:
+                    if quote == b"$'" and char == b"\\":
+                        cursor += 2
+                        continue
+                    if char == b"'":
+                        quote = None
+                    cursor += 1
+                    continue
+                if (
+                    char == b"\\"
+                    and (
+                        (lexical_quotes and quote is None)
+                        or source[cursor + 1 : cursor + 2]
+                        in {b"\\", b"$", b"`", b"\n"}
+                        or (
+                            lexical_quotes
+                            and source[cursor + 1 : cursor + 2] == b'"'
+                        )
+                    )
+                ):
+                    cursor += 2
+                    continue
+                if lexical_quotes and char == b"'" and quote is None:
+                    quote = b"'"
+                    cursor += 1
+                    continue
+                if lexical_quotes and char == b'"':
+                    quote = None if quote == b'"' else b'"'
+                    cursor += 1
+                    continue
+                if source[cursor : cursor + 1] == b"$":
+                    following = cursor + 1
+                    while (
+                        following + 2 <= end
+                        and source[following : following + 2] == b"\\\n"
+                    ):
+                        following += 2
+                    if (
+                        lexical_quotes and quote is None
+                        and source[following : following + 1] == b"'"
+                    ):
+                        quote = b"$'"
+                        cursor = following + 1
+                        continue
+                    if source[following : following + 1] == b"$":
+                        # Continuations do not split the logical PID token.
+                        cursor = following + 1
+                        continue
+                if source[cursor : cursor + 1] == b"$" and split_at(cursor, end):
+                    return cursor
+                cursor += 1
+            return None
+
+        pending = [(root, False, False)]
+        while pending:
+            node, operand, quoted = pending.pop()
+            if node.type in {"command_substitution", "process_substitution"}:
+                # Nested shell commands establish their own quoting context.
+                operand = quoted = False
+            elif node.type in {"string", "heredoc_body"}:
+                quoted = True
+            if node.type == "expansion":
+                operand = True
+            if node.type == "heredoc_redirect":
+                delimiter = next(
+                    (child for child in node.children if child.type == "heredoc_start"),
+                    None,
+                )
+                if delimiter is not None:
+                    spelling = source[delimiter.start_byte : delimiter.end_byte]
+                    spelling = spelling.replace(b"\\\n", b"")
+                    if any(marker in spelling for marker in (b"'", b'"', b"\\")):
+                        # Bash disables body expansion if ANY delimiter part is
+                        # quoted, even when the grammar treats it as active.
+                        pending.extend(
+                            reversed([
+                                (child, operand, quoted) for child in node.children
+                                if child.type != "heredoc_body"
+                            ])
+                        )
+                        continue
+            if node.type == "heredoc_body":
+                # A prefixed dollar can remain inside opaque heredoc content.
+                # Scan literal regions, not the source of recognized expansions:
+                # quotes inside those nested commands have their own semantics.
+                start = node.start_byte
+                regions = []
+                for child in node.named_children:
+                    if child.type != "heredoc_content":
+                        regions.append((start, child.start_byte))
+                        start = child.end_byte
+                regions.append((start, node.end_byte))
+                for start, end in regions:
+                    found = scan_range(start, end)
+                    if found is not None:
+                        return found
+            if not node.children and (
+                node.type == "regex"
+                or (
+                    operand
+                    and (
+                        node.type == "word"
+                        or (quoted and node.type in {"raw_string", "ansi_c_string"})
+                    )
+                )
+            ):
+                # Regex and parameter-operand leaves can hide active syntax.
+                # Only a regex outside inherited quoting has its own lexical
+                # quotes; apostrophes in a heredoc or double quote are literal.
+                found = scan_range(
+                    node.start_byte, node.end_byte,
+                    lexical_quotes=node.type == "regex" and not quoted,
+                )
+                if found is not None:
+                    return found
+            if node.type in {"string", "simple_expansion"}:
+                for child in node.children:
+                    if (
+                        child.type != "$"
+                        or source[child.start_byte : child.end_byte] != b"$"
+                    ):
+                        continue
+                    if split_at(child.start_byte, len(source)):
+                        return child.start_byte
+            pending.extend(
+                (child, operand, quoted) for child in reversed(node.children)
+            )
+        return None
 
     def _collect_command_nodes(
         self,
