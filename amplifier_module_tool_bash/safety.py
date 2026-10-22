@@ -35,6 +35,7 @@ from tree_sitter import Language, Node, Parser
 _BASH_LANGUAGE = Language(tree_sitter_bash.language())
 _DYNAMIC_WORD_NODES = {
     "arithmetic_expansion",
+    "brace_expression",
     "command_substitution",
     "expansion",
     "process_substitution",
@@ -51,13 +52,36 @@ _NON_ARGUMENT_NODES = {
 
 @dataclass(frozen=True)
 class _ShellWord:
-    value: str
+    # None means the actual value is unknown, never a raw source fallback.
+    value: str | None
     dynamic: bool = False
     opaque_quoting: bool = False
 
 
 class _UnsafeShellSyntax(ValueError):
     """Raised when a restricted profile cannot safely inspect a command."""
+
+    def __init__(
+        self, reason: str, *, stage: str | None = None,
+        scope: str = "top_level", depth: int = 0,
+        line: int | None = None, byte_column: int | None = None,
+        node_category: str | None = None,
+    ):
+        # Callers supply fixed labels and parser coordinates, never source text.
+        if stage is not None:
+            details = f"stage={stage}, scope={scope}, depth={depth}"
+            if line is not None and byte_column is not None:
+                details += (
+                    f"; reported parser location: line {line}, byte column {byte_column}"
+                )
+                if scope == "shell_c":
+                    details += "; coordinates within decoded nested script"
+                elif scope == "eval":
+                    details += "; coordinates within joined eval arguments"
+            if node_category is not None:
+                details += f"; node={node_category}"
+            reason = f"{reason} ({details})"
+        super().__init__(reason)
 
 
 @dataclass
@@ -277,23 +301,25 @@ class SafetyValidator:
 
         try:
             parsed_commands = self._parse_shell_commands(command)
+            # Critical argument checks can also refuse unknown values here.
+            for pattern in self.profile.blocked_patterns:
+                if self._check_pattern(command, pattern, parsed_commands):
+                    return SafetyResult(
+                        allowed=False,
+                        reason=pattern.reason,
+                        matched_pattern=pattern.pattern,
+                        hint="Use safety_profile: 'permissive' or 'unrestricted' for container/VM environments",
+                    )
         except _UnsafeShellSyntax as exc:
             return SafetyResult(
                 allowed=False,
                 reason=f"Unable to safely analyze Bash syntax: {exc}",
                 matched_pattern="<unsupported bash syntax>",
-                hint="Use safety_profile: 'unrestricted' only in a trusted container/VM environment",
+                hint=(
+                    "Command was not executed. Safety analysis could not inspect this "
+                    "syntax; report a minimal non-sensitive reproducer."
+                ),
             )
-
-        # 3. Check blocked patterns with smart matching
-        for pattern in self.profile.blocked_patterns:
-            if self._check_pattern(command, pattern, parsed_commands):
-                return SafetyResult(
-                    allowed=False,
-                    reason=pattern.reason,
-                    matched_pattern=pattern.pattern,
-                    hint="Use safety_profile: 'permissive' or 'unrestricted' for container/VM environments",
-                )
 
         # 4. Check custom denied_commands (supports wildcards)
         for denied in self.denied_commands:
@@ -373,21 +399,45 @@ class SafetyValidator:
         return False
 
     def _parse_shell_commands(
-        self, command: str, *, depth: int = 0
+        self, command: str, *, depth: int = 0, scope: str = "top_level"
     ) -> list[list[_ShellWord]]:
         """Parse every simple command, including substitutions and shell -c scripts."""
         if not command.strip():
             return []
         if depth > 10:
-            raise _UnsafeShellSyntax("nested shell command depth exceeds safety limit")
+            raise _UnsafeShellSyntax(
+                "nested shell command depth exceeds safety limit",
+                stage="nesting_depth", scope=scope, depth=depth,
+            )
 
         source = command.encode()
         root = Parser(_BASH_LANGUAGE).parse(source).root_node
         if root.has_error:
-            raise _UnsafeShellSyntax("invalid or unsupported Bash syntax")
+            failure = _UnsafeShellSyntax("invalid or unsupported Bash syntax")
+            try:
+                # Preorder over ALL children includes anonymous missing tokens.
+                pending = [root]
+                while pending:
+                    node = pending.pop()
+                    if node.type == "ERROR" or node.is_missing:
+                        row, column = node.start_point
+                        failure = _UnsafeShellSyntax(
+                            "invalid or unsupported Bash syntax",
+                            stage="tree_parse", scope=scope, depth=depth,
+                            line=row + 1, byte_column=column + 1,
+                            node_category="missing" if node.is_missing else "ERROR",
+                        )
+                        break
+                    pending.extend(reversed(node.children))
+            except Exception:
+                # Diagnostics are best-effort; the refusal is unconditional.
+                pass
+            raise failure
 
         parsed_commands: list[list[_ShellWord]] = []
-        self._collect_command_nodes(root, source, parsed_commands)
+        self._collect_command_nodes(
+            root, source, parsed_commands, scope=scope, depth=depth
+        )
 
         nested_commands: list[list[_ShellWord]] = []
         for words in parsed_commands:
@@ -395,28 +445,29 @@ class SafetyValidator:
             if not effective:
                 continue
 
-            executable = self._command_basename(effective[0].value)
+            executable = self._command_basename(
+                self._require_static(effective[0], "command name")
+            )
             if executable in {"bash", "dash", "ksh", "sh", "zsh"}:
                 script = self._shell_script_argument(effective)
                 if script is not None:
-                    if script.dynamic:
-                        raise _UnsafeShellSyntax(
-                            "dynamic shell -c command cannot be inspected"
-                        )
+                    script_value = self._require_static(script, "shell -c command")
                     nested_commands.extend(
-                        self._parse_shell_commands(script.value, depth=depth + 1)
+                        self._parse_shell_commands(
+                            script_value, depth=depth + 1, scope="shell_c"
+                        )
                     )
             elif executable == "eval":
                 arguments = effective[1:]
-                if any(argument.dynamic for argument in arguments):
-                    raise _UnsafeShellSyntax(
-                        "dynamic eval command cannot be inspected"
-                    )
+                values = [
+                    self._require_static(argument, "eval argument")
+                    for argument in arguments
+                ]
                 if arguments:
                     nested_commands.extend(
                         self._parse_shell_commands(
-                            " ".join(argument.value for argument in arguments),
-                            depth=depth + 1,
+                            " ".join(values),
+                            depth=depth + 1, scope="eval",
                         )
                     )
 
@@ -427,48 +478,161 @@ class SafetyValidator:
         node: Node,
         source: bytes,
         commands: list[list[_ShellWord]],
+        *, scope: str = "top_level", depth: int = 0,
     ) -> None:
         if node.type == "command":
             words: list[_ShellWord] = []
-            for child in node.named_children:
+            previous: Node | None = None
+            for child in node.children:
                 if child.type in _NON_ARGUMENT_NODES:
                     continue
-                words.append(self._shell_word(child, source))
+                word = self._shell_word(child, source, scope=scope, depth=depth)
+                # The grammar can split a word at a continuation, or expose a
+                # literal $ as an anonymous sibling. Neither is an argv boundary.
+                adjacent = previous is not None and not source[
+                    previous.end_byte : child.start_byte
+                ].replace(b"\\\n", b"")
+                if adjacent:
+                    locale = previous.type == "$" and child.type == "string"
+                    words[-1] = self._combine_words(words[-1], word, opaque=locale)
+                else:
+                    words.append(word)
+                previous = child
             if words:
                 commands.append(words)
 
         for child in node.named_children:
-            self._collect_command_nodes(child, source, commands)
+            self._collect_command_nodes(
+                child, source, commands, scope=scope, depth=depth
+            )
 
-    def _shell_word(self, node: Node, source: bytes) -> _ShellWord:
-        text = source[node.start_byte : node.end_byte].decode()
+    def _shell_word(
+        self, node: Node, source: bytes, *, scope: str = "top_level", depth: int = 0
+    ) -> _ShellWord:
         try:
-            parsed = shlex.split(text)
-        except ValueError as exc:
-            raise _UnsafeShellSyntax(f"cannot inspect shell word: {exc}") from exc
-
-        value = parsed[0] if len(parsed) == 1 else text
-        dynamic = node.type in _DYNAMIC_WORD_NODES or any(
-            descendant.type in _DYNAMIC_WORD_NODES
-            for descendant in self._descendants(node)
+            return self._decode_word_node(node, source)
+        except ValueError:
+            # Do not retain a source-bearing decoder exception as context.
+            pass
+        failure = _UnsafeShellSyntax(
+            "cannot inspect shell word", stage="shell_word", scope=scope, depth=depth
         )
-        # shlex does not decode Bash's ANSI-C or locale-translated strings.
-        # Keep ordinary data arguments usable, but never compare these spellings
-        # as executable names, wrapper options, or deletion targets.
-        opaque_quoting = any(
-            source[part.start_byte : part.start_byte + 2] in (b"$'", b'$"')
-            for part in (node, *self._descendants(node))
-        )
-        return _ShellWord(value=value, dynamic=dynamic, opaque_quoting=opaque_quoting)
+        try:
+            row, column = node.start_point
+            failure = _UnsafeShellSyntax(
+                "cannot inspect shell word", stage="shell_word", scope=scope, depth=depth,
+                line=row + 1, byte_column=column + 1,
+            )
+        except Exception:
+            pass
+        raise failure
 
-    def _descendants(self, node: Node) -> list[Node]:
-        descendants: list[Node] = []
-        pending = list(node.named_children)
-        while pending:
-            child = pending.pop()
-            descendants.append(child)
-            pending.extend(child.named_children)
-        return descendants
+    def _decode_word_node(self, node: Node, source: bytes) -> _ShellWord:
+        """Decode only literal AST fragments; never interpret expansions."""
+        kind = node.type
+        if kind in _DYNAMIC_WORD_NODES:
+            return _ShellWord(None, dynamic=True)
+        if kind in {"ansi_c_string", "translated_string"}:
+            return _ShellWord(None, opaque_quoting=True)
+        text = source[node.start_byte : node.end_byte].decode()
+        if kind == "raw_string":
+            if not (text.startswith("'") and text.endswith("'")):
+                raise ValueError("unsupported literal")
+            return _ShellWord(text[1:-1])
+        if kind == "string":
+            if not (text.startswith('"') and text.endswith('"')):
+                raise ValueError("unsupported literal")
+            return self._decode_word_parts(
+                node.children[1:-1], source, node.start_byte + 1,
+                node.end_byte - 1, double_quoted=True,
+            )
+        if kind in {"command_name", "concatenation", "word", "number"}:
+            # In particular a number can contain nested substitutions.
+            if node.children:
+                return self._decode_word_parts(
+                    node.children, source, node.start_byte, node.end_byte
+                )
+            return self._decode_literal_fragment(text)
+        if kind == "string_content":
+            return self._decode_literal_fragment(text, double_quoted=True)
+        if kind == "$" and text == "$":
+            return _ShellWord("$")
+        raise ValueError("unsupported word node")
+
+    def _decode_word_parts(
+        self, children: list[Node], source: bytes, start: int, end: int,
+        *, double_quoted: bool = False,
+    ) -> _ShellWord:
+        result = _ShellWord("")
+        previous: Node | None = None
+        cursor = start
+        for child in children:
+            gap = source[cursor : child.start_byte].decode()
+            result = self._combine_words(
+                result,
+                self._decode_literal_fragment(gap, double_quoted=double_quoted),
+            )
+            locale = (
+                not double_quoted and previous is not None
+                and previous.type == "$" and child.type == "string"
+                and not gap.replace("\\\n", "")
+            )
+            result = self._combine_words(
+                result, self._decode_word_node(child, source), opaque=locale
+            )
+            previous = child
+            cursor = child.end_byte
+        return self._combine_words(
+            result,
+            self._decode_literal_fragment(
+                source[cursor:end].decode(), double_quoted=double_quoted
+            ),
+        )
+
+    def _decode_literal_fragment(
+        self, text: str, *, double_quoted: bool = False
+    ) -> _ShellWord:
+        """Remove backslashes at AST literal boundaries, not shell syntax."""
+        decoded: list[str] = []
+        unknown = False
+        index = 0
+        while index < len(text):
+            char = text[index]
+            if char == "\\":
+                index += 1
+                if index == len(text):
+                    raise ValueError("incomplete escape")
+                following = text[index]
+                if following != "\n":
+                    if double_quoted and following not in '$`"\\':
+                        decoded.append("\\")
+                    decoded.append(following)
+            else:
+                if char == '"' or (not double_quoted and char == "'"):
+                    raise ValueError("unexpected quote in literal fragment")
+                if not double_quoted and char in "*?[]{}~":
+                    unknown = True
+                decoded.append(char)
+            index += 1
+        return _ShellWord(None if unknown else "".join(decoded), dynamic=unknown)
+
+    def _combine_words(
+        self, left: _ShellWord, right: _ShellWord, *, opaque: bool = False
+    ) -> _ShellWord:
+        value = None
+        if left.value is not None and right.value is not None and not opaque:
+            value = left.value + right.value
+        return _ShellWord(
+            value,
+            dynamic=left.dynamic or right.dynamic,
+            opaque_quoting=opaque or left.opaque_quoting or right.opaque_quoting,
+        )
+
+    def _require_static(self, word: _ShellWord, context: str) -> str:
+        # Context is always a fixed caller label, never source text.
+        if word.value is None:
+            raise _UnsafeShellSyntax(f"unknown {context} cannot be inspected")
+        return word.value
 
     def _effective_command(
         self, words: list[_ShellWord]
@@ -476,16 +640,9 @@ class SafetyValidator:
         """Remove command-preserving prefixes and return the invoked command."""
         remaining = words
         while remaining:
-            if remaining[0].dynamic or remaining[0].opaque_quoting:
-                raise _UnsafeShellSyntax("dynamic command name cannot be inspected")
-
-            executable = self._command_basename(remaining[0].value)
-            if executable in {"rm", "env", "command", "exec", "nohup", "time"} and any(
-                word.opaque_quoting for word in remaining[1:]
-            ):
-                raise _UnsafeShellSyntax(
-                    "Bash-specific quoted command arguments cannot be inspected"
-                )
+            executable = self._command_basename(
+                self._require_static(remaining[0], "command name")
+            )
             if executable == "env":
                 remaining = self._unwrap_env(remaining[1:])
             elif executable == "command":
@@ -514,10 +671,7 @@ class SafetyValidator:
         """
         index = 0
         while index < len(arguments):
-            argument = arguments[index]
-            if argument.dynamic or argument.opaque_quoting:
-                raise _UnsafeShellSyntax(f"dynamic {executable} option or command")
-            value = argument.value
+            value = self._require_static(arguments[index], "execution wrapper prefix")
             if value == "--":
                 return arguments[index + 1 :]
             if value in {"--help", "--version"}:
@@ -556,26 +710,29 @@ class SafetyValidator:
                 )
                 known = takes_value or attached
             if not known:
-                raise _UnsafeShellSyntax(f"unsupported {executable} option: {value}")
+                raise _UnsafeShellSyntax(f"unsupported {executable} option")
             if takes_value:
                 index += 1
                 if index >= len(arguments):
                     raise _UnsafeShellSyntax(
                         f"{executable} option is missing its value"
                     )
-                if arguments[index].dynamic or arguments[index].opaque_quoting:
-                    raise _UnsafeShellSyntax(f"dynamic {executable} option value")
+                self._require_static(arguments[index], "execution wrapper option value")
             index += 1
         return []
 
     def _unwrap_env(self, arguments: list[_ShellWord]) -> list[_ShellWord]:
         index = 0
+        options_ended = False
         while index < len(arguments):
-            value = arguments[index].value
-            if value == "--":
-                index += 1
-                break
+            value = self._require_static(arguments[index], "env prefix")
             if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", value):
+                index += 1
+                continue
+            if options_ended:
+                break
+            if value == "--":
+                options_ended = True
                 index += 1
                 continue
             if value in {"-S", "--split-string"} or value.startswith(
@@ -583,14 +740,21 @@ class SafetyValidator:
             ):
                 raise _UnsafeShellSyntax("env split-string command cannot be inspected")
             if value in {"-u", "--unset", "-C", "--chdir"}:
+                if index + 1 >= len(arguments):
+                    raise _UnsafeShellSyntax("env option is missing its value")
+                self._require_static(arguments[index + 1], "env option value")
                 index += 2
                 continue
             if value.startswith(("--unset=", "--chdir=")):
                 index += 1
                 continue
-            if value.startswith("-") and value != "-":
+            if value in {"--help", "--version"}:
+                return []
+            if value in {"-", "-i", "--ignore-environment", "-0", "--null", "-v", "--debug"}:
                 index += 1
                 continue
+            if value.startswith("-"):
+                raise _UnsafeShellSyntax("unsupported env option")
             break
         return arguments[index:]
 
@@ -599,7 +763,7 @@ class SafetyValidator:
     ) -> list[_ShellWord]:
         index = 0
         while index < len(arguments):
-            value = arguments[index].value
+            value = self._require_static(arguments[index], "command prefix")
             if value == "--":
                 index += 1
                 break
@@ -608,50 +772,74 @@ class SafetyValidator:
             if value == "-p":
                 index += 1
                 continue
+            if value.startswith("-"):
+                raise _UnsafeShellSyntax("unsupported command option")
             break
         return arguments[index:]
 
     def _unwrap_exec(self, arguments: list[_ShellWord]) -> list[_ShellWord]:
         index = 0
         while index < len(arguments):
-            value = arguments[index].value
+            value = self._require_static(arguments[index], "exec prefix")
             if value == "--":
                 index += 1
                 break
             if value == "-a":
+                if index + 1 >= len(arguments):
+                    raise _UnsafeShellSyntax("exec option is missing its value")
+                self._require_static(arguments[index + 1], "exec option value")
                 index += 2
                 continue
-            if value.startswith("-") and value != "-":
+            if value in {"-c", "-l", "-cl", "-lc"}:
                 index += 1
                 continue
+            if value.startswith("-"):
+                raise _UnsafeShellSyntax("unsupported exec option")
             break
         return arguments[index:]
 
     def _unwrap_simple_prefix(
         self, arguments: list[_ShellWord]
     ) -> list[_ShellWord]:
-        if arguments and arguments[0].value == "--":
-            return arguments[1:]
-        if arguments and arguments[0].value in {"--help", "--version"}:
+        if not arguments:
             return []
+        value = self._require_static(arguments[0], "nohup prefix")
+        if value == "--":
+            return arguments[1:]
+        if value in {"--help", "--version"}:
+            return []
+        if value.startswith("-"):
+            raise _UnsafeShellSyntax("unsupported nohup option")
         return arguments
 
     def _unwrap_time(self, arguments: list[_ShellWord]) -> list[_ShellWord]:
         index = 0
         while index < len(arguments):
-            value = arguments[index].value
+            value = self._require_static(arguments[index], "time prefix")
             if value == "--":
                 index += 1
                 break
             if value in {"-f", "--format", "-o", "--output"}:
+                if index + 1 >= len(arguments):
+                    raise _UnsafeShellSyntax("time option is missing its value")
+                self._require_static(arguments[index + 1], "time option value")
                 index += 2
                 continue
-            if value.startswith(("--format=", "--output=")):
+            if value.startswith(("--format=", "--output=")) or (
+                len(value) > 2 and value[:2] in {"-f", "-o"}
+            ):
                 index += 1
                 continue
-            if value.startswith("-") and value != "-":
+            if value in {"--help", "--version"}:
+                return []
+            if value in {"--portability", "--verbose", "--append", "--quiet"} or (
+                value.startswith("-") and not value.startswith("--")
+                and len(value) > 1 and set(value[1:]) <= set("pvaq")
+            ):
                 index += 1
                 continue
+            if value.startswith("-"):
+                raise _UnsafeShellSyntax("unsupported time option")
             break
         return arguments[index:]
 
@@ -660,13 +848,13 @@ class SafetyValidator:
     ) -> _ShellWord | None:
         index = 1
         while index < len(words):
-            argument = words[index]
-            value = argument.value
+            value = self._require_static(words[index], "shell option or script path")
             if value == "--":
                 return None
             if value in {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}:
                 if index + 1 >= len(words):
                     raise _UnsafeShellSyntax("shell option is missing its value")
+                self._require_static(words[index + 1], "shell option value")
                 index += 2
                 continue
             if (
@@ -677,6 +865,17 @@ class SafetyValidator:
                 raise _UnsafeShellSyntax(
                     "combined shell option with a value cannot be inspected"
                 )
+            if value.startswith("--"):
+                if value not in {
+                    "--debugger", "--dump-po-strings", "--dump-strings", "--help",
+                    "--login", "--noediting", "--noprofile", "--norc", "--posix",
+                    "--pretty-print", "--restricted", "--verbose", "--version",
+                }:
+                    raise _UnsafeShellSyntax("unsupported shell option")
+            elif value.startswith(("-", "+")) and (
+                len(value) < 2 or not set(value[1:]) <= set("abBceCDEfhHiklmnpPrstTuvx")
+            ):
+                raise _UnsafeShellSyntax("unsupported shell option")
             if value == "-c" or (
                 value.startswith("-")
                 and not value.startswith("--")
@@ -745,10 +944,9 @@ class SafetyValidator:
                     return True
                 continue
 
-            if len(effective) < len(pattern_words):
-                continue
-
-            actual_executable = self._command_basename(effective[0].value)
+            actual_executable = self._command_basename(
+                self._require_static(effective[0], "command name")
+            )
             expected_executable = self._command_basename(pattern_words[0])
             executable_matches = actual_executable == expected_executable
             if expected_executable == "mkfs":
@@ -759,8 +957,13 @@ class SafetyValidator:
                 continue
 
             actual_arguments = [
-                word.value.lower() for word in effective[1 : len(pattern_words)]
+                self._require_static(word, "blocked command argument").lower()
+                for word in effective[1 : len(pattern_words)]
             ]
+            # An unknown expansion could change argv length, so require known
+            # compared arguments before ruling out a longer blocked pattern.
+            if len(effective) < len(pattern_words):
+                continue
             expected_arguments = [word.lower() for word in pattern_words[1:]]
             if actual_arguments == expected_arguments:
                 return True
@@ -770,7 +973,7 @@ class SafetyValidator:
     def _matches_dangerous_rm(
         self, words: list[_ShellWord], blocked_target: str
     ) -> bool:
-        if self._command_basename(words[0].value) != "rm":
+        if self._command_basename(self._require_static(words[0], "command name")) != "rm":
             return False
 
         recursive = False
@@ -778,7 +981,8 @@ class SafetyValidator:
         operands: list[str] = []
         options_ended = False
         for word in words[1:]:
-            value = word.value
+            # Every rm argument is critical, including flags and words after --.
+            value = self._require_static(word, "rm argument")
             if not options_ended and value == "--":
                 options_ended = True
                 continue
