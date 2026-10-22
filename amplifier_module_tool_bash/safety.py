@@ -499,14 +499,39 @@ class SafetyValidator:
                 and source[cursor : cursor + 1] in {b"(", b"{"}
             )
 
-        def scan_range(start: int, end: int) -> int | None:
+        def scan_range(
+            start: int, end: int, *, lexical_quotes: bool = False
+        ) -> int | None:
             cursor = start
+            quote = None
             while cursor < end:
+                char = source[cursor : cursor + 1]
+                if lexical_quotes and quote == b"'":
+                    if char == b"'":
+                        quote = None
+                    cursor += 1
+                    continue
                 if (
-                    source[cursor : cursor + 1] == b"\\"
-                    and source[cursor + 1 : cursor + 2] in {b"\\", b"$", b"`", b"\n"}
+                    char == b"\\"
+                    and (
+                        (lexical_quotes and quote is None)
+                        or source[cursor + 1 : cursor + 2]
+                        in {b"\\", b"$", b"`", b"\n"}
+                        or (
+                            lexical_quotes
+                            and source[cursor + 1 : cursor + 2] == b'"'
+                        )
+                    )
                 ):
                     cursor += 2
+                    continue
+                if lexical_quotes and char == b"'" and quote is None:
+                    quote = b"'"
+                    cursor += 1
+                    continue
+                if lexical_quotes and char == b'"':
+                    quote = None if quote == b'"' else b'"'
+                    cursor += 1
                     continue
                 if source[cursor : cursor + 1] == b"$":
                     following = cursor + 1
@@ -567,14 +592,23 @@ class SafetyValidator:
                     found = scan_range(start, end)
                     if found is not None:
                         return found
-            if operand and not node.children and (
-                node.type in {"word", "regex"}
-                or (quoted and node.type in {"raw_string", "ansi_c_string"})
+            if not node.children and (
+                node.type == "regex"
+                or (
+                    operand
+                    and (
+                        node.type == "word"
+                        or (quoted and node.type in {"raw_string", "ansi_c_string"})
+                    )
+                )
             ):
-                # The grammar can hide an active introducer in a parameter
-                # operand's fallback word. Apostrophes inside an inherited
-                # double-quoted context do not make that operand literal.
-                found = scan_range(node.start_byte, node.end_byte)
+                # Regex and parameter-operand leaves can hide active syntax.
+                # Only a regex outside inherited quoting has its own lexical
+                # quotes; apostrophes in a heredoc or double quote are literal.
+                found = scan_range(
+                    node.start_byte, node.end_byte,
+                    lexical_quotes=node.type == "regex" and not quoted,
+                )
                 if found is not None:
                     return found
             if node.type in {"string", "simple_expansion"}:

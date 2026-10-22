@@ -36,6 +36,7 @@ _MULTIPLE_HEREDOCS = "cat <<'LEFT' <<'RIGHT'\none\nLEFT\ntwo\nRIGHT\n"
 _WORD_DECODER_SCRIPT = '''printf '%s' "$(printf "'")"'''
 _CONTINUED_SUBSTITUTION = "$" + chr(92) + chr(10) + "(printf SYNTHETIC_MARKER)"
 _CONTINUED_PARAMETER_OPERAND = "${SYNTHETIC_UNSET:-" + _CONTINUED_SUBSTITUTION + "}"
+_CONTINUED_REGEX = "[[ x =~ " + _CONTINUED_SUBSTITUTION + " ]]"
 
 
 class TestContinuedExpansion:
@@ -84,6 +85,8 @@ class TestContinuedExpansion:
             "echo ${{X//{}/b}}",
             "echo ${{X#{}}}",
             "echo ${{X%{}}}",
+            'echo ${{X:-"{}"}}',
+            'echo "${{X:-"{}"}}"',
             'echo "${{X:-{}}}"',
             'echo "${{X:-\'{}\'}}"',
             'echo "${{X:-$\'{}\'}}"',
@@ -100,6 +103,33 @@ class TestContinuedExpansion:
         assert "stage=continuation_expansion" in result.reason
         assert result.hint == _SYNTAX_HINT
         assert "SYNTHETIC_MARKER" not in result.reason
+
+    @pytest.mark.parametrize("profile", ["strict", "standard", "permissive"])
+    @pytest.mark.parametrize(
+        "template", ["[[ x =~ {} ]]", '[[ x =~ "{}" ]]', "[[ x =~ 'prefix'{} ]]"]
+    )
+    def test_opaque_regex_introducer_is_guarded(self, profile, template):
+        result = SafetyValidator(profile=profile).validate(
+            template.format(self.split_substitution)
+        )
+        assert not result.allowed
+        assert "stage=continuation_expansion" in result.reason
+        assert result.hint == _SYNTAX_HINT
+
+    @pytest.mark.parametrize(
+        "template",
+        ["[[ x =~ '{}' ]]", "[[ x =~ \\{} ]]", '[[ x =~ "\\{}" ]]'],
+    )
+    def test_opaque_regex_literal_dollar_remains_allowed(self, template):
+        assert SafetyValidator().validate(
+            template.format(self.split_substitution)
+        ).allowed
+
+    @pytest.mark.parametrize("separated", [False, True])
+    def test_opaque_regex_pid_expansion_remains_allowed(self, separated):
+        dollars = "$" + (self.continuation if separated else "") + "$"
+        command = "[[ x =~ " + dollars + self.continuation + "(literal) ]]"
+        assert SafetyValidator().validate(command).allowed
 
     @pytest.mark.parametrize("context", ["bare", "outer_string", "heredoc"])
     def test_nested_command_resets_inherited_parameter_quote_context(self, context):
@@ -902,6 +932,7 @@ class TestSyntaxDiagnostics:
         "cat <<EOF\nprefix " + _CONTINUED_SUBSTITUTION + "\nEOF\n",
         "echo " + _CONTINUED_PARAMETER_OPERAND,
         "cat <<EOF\nprefix " + _CONTINUED_PARAMETER_OPERAND + "\nEOF\n",
+        _CONTINUED_REGEX,
     ],
 )
 @pytest.mark.parametrize("run_in_background", [False, True])
