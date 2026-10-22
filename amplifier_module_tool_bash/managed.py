@@ -273,7 +273,10 @@ class ManagedProcesses:
         )
         safety = self.tool._safety_validator.validate(command)
         if not safety.allowed:
-            raise ValueError(f"Command denied for safety: {safety.reason}")
+            error_msg = f"Command denied for safety: {safety.reason}"
+            if safety.hint:
+                error_msg += f"\n  Hint: {safety.hint}"
+            raise ValueError(error_msg)
         if (
             self.tool.max_concurrent is not None
             and self.tool._active_commands >= self.tool.max_concurrent

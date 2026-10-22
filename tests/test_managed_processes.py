@@ -3,7 +3,7 @@
 import asyncio
 import shlex
 import sys
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
@@ -418,6 +418,61 @@ async def test_managed_start_uses_same_shell_validator():
     ).success
     assert tool._active_commands == 0
     assert not tool._processes.records
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    [
+        "if true; then printf synthetic",
+        "cat <<'LEFT' <<'RIGHT'\none\nLEFT\ntwo\nRIGHT\n",
+        # The original nested-quote fixture is now a validator-positive case
+        # in test_safety.py. Keep these pipe/PTY seams strictly non-executing.
+        'rm -rf "$SYNTHETIC"',
+        "sh -c $'printf ok'",
+    ],
+)
+@pytest.mark.parametrize("pty", [False, True])
+async def test_managed_start_syntax_diagnostics_never_spawn(command, pty):
+    tool = BashTool(
+        {
+            "managed_processes": True,
+            "managed_pty": True,
+            "safety_profile": "strict",
+        }
+    )
+    safety = tool._safety_validator.validate(command)
+    try:
+        with (
+            patch(
+                "asyncio.create_subprocess_shell", new_callable=AsyncMock,
+                side_effect=AssertionError("unexpected spawn"),
+            ) as spawn_shell,
+            patch(
+                "asyncio.create_subprocess_exec", new_callable=AsyncMock,
+                side_effect=AssertionError("unexpected spawn"),
+            ) as spawn_exec,
+            patch(
+                "subprocess.Popen", side_effect=AssertionError("unexpected spawn"),
+            ) as popen,
+        ):
+            result = await tool.execute(
+                {"action": "start", "command": command, "pty": pty}
+            )
+        assert not result.success
+        assert result.error["message"] == (
+            f"Command denied for safety: {safety.reason}\n  Hint: {safety.hint}"
+        )
+        assert result.output == result.error["message"]
+        assert safety.hint.startswith("Command was not executed.")
+        assert safety.hint in result.error["message"]
+        assert tool._active_commands == 0
+        assert not tool._processes.records
+        spawn_shell.assert_not_called()
+        spawn_exec.assert_not_called()
+        popen.assert_not_called()
+    finally:
+        await tool.close()
 
 
 @pytest.mark.asyncio

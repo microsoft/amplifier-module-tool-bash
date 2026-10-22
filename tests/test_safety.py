@@ -8,18 +8,695 @@ Tests cover:
 - Configuration options
 """
 
+import shlex
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, PropertyMock, patch
+
 import pytest
-from unittest.mock import AsyncMock, patch
 
 from amplifier_module_tool_bash import BashTool
+from amplifier_module_tool_bash import safety as safety_module
 from amplifier_module_tool_bash.safety import (
     SafetyConfig,
     SafetyResult,
     SafetyValidator,
+    _ShellWord,
+    _UnsafeShellSyntax,
 )
 
 # Note: BlockPattern and SafetyProfile are not directly used in tests
 # but are tested indirectly through SafetyValidator
+
+_SYNTAX_HINT = (
+    "Command was not executed. Safety analysis could not inspect this syntax; "
+    "report a minimal non-sensitive reproducer."
+)
+_INVALID_SCRIPT = "if true; then printf synthetic"
+_MULTIPLE_HEREDOCS = "cat <<'LEFT' <<'RIGHT'\none\nLEFT\ntwo\nRIGHT\n"
+_WORD_DECODER_SCRIPT = '''printf '%s' "$(printf "'")"'''
+
+
+class TestSemanticShellWords:
+    """Validator-only fixtures. No shell evaluates any of these strings."""
+
+    @pytest.mark.parametrize(
+        "argument,expected",
+        [
+            ("''", ""),
+            ('""', ""),
+            ("""a'bc'"dé"f""", "abcdéf"),
+            (r"a\ b", "a b"),
+            (r"a\'b", "a'b"),
+            (r'a\"b', 'a"b'),
+            (r"a\\b", "a\\b"),
+            (r"a\$b", "a$b"),
+            ('"a\\\'b"', "a\\'b"),
+            (r'"a\qb"', "a\\qb"),
+            (r'"a\$b"', "a$b"),
+            (r'"a\`b"', "a`b"),
+            (r'"a\\b"', "a\\b"),
+            (r'"a\"b"', 'a"b'),
+            ("a\\\nb", "ab"),
+            ("a\\\n\\\nb", "ab"),
+            ('ab\\\n"cd"ef', "abcdef"),
+            ('\\\n"hello"', "hello"),
+            ("\\\n'hello'", "hello"),
+            ('"a\\\nb"', "ab"),
+            ("'a\\\nb'", "a\\\nb"),
+            ("'你好🌍'", "你好🌍"),
+            (r"\*\?\[ab\]\{x,y\}\~", "*?[ab]{x,y}~"),
+            ('"*?[ab]{x,y}~"', "*?[ab]{x,y}~"),
+            ("'*?[ab]{x,y}~'", "*?[ab]{x,y}~"),
+            ("123", "123"),
+        ],
+    )
+    def test_static_words_decode_at_ast_boundaries(self, argument, expected):
+        validator = SafetyValidator()
+        script = "printf " + argument
+        assert validator.validate(script).allowed
+        words = validator._parse_shell_commands(script)[0]
+        assert [word.value for word in words] == ["printf", expected]
+        assert not words[1].dynamic
+        assert not words[1].opaque_quoting
+
+    @pytest.mark.parametrize(
+        "argument",
+        [
+            "$X", '"$X"', "${X:-literal}", "$(printf x)", "`printf x`",
+            "<(printf x)", "$((1+2))", "'pre'$X\"post\"",
+            "$'hello'", '$"hello"', 'a$"b"c', "*", "?", "[ab]", "{a,b}",
+            "{1..3}", "~/x", "a\\\n$X", "123$(printf 1)",
+            '$\\\n"hello"', 'a\\\n$"b"', "$\\\n'hello'",
+        ],
+    )
+    def test_unknown_word_value_never_contains_source(self, argument):
+        validator = SafetyValidator()
+        script = "printf " + argument
+        assert validator.validate(script).allowed
+        word = validator._parse_shell_commands(script)[0][1]
+        assert word.value is None
+        assert word.dynamic or word.opaque_quoting
+
+    def test_anonymous_dollars_are_arguments_and_locale_quotes_are_opaque(self):
+        words = SafetyValidator()._parse_shell_commands(
+            '''printf $ "$" a$ "a$" $"" a$"b"'''
+        )[0]
+        assert [word.value for word in words] == [
+            "printf", "$", "$", "a$", "a$", None, None,
+        ]
+        assert words[-1].opaque_quoting
+        assert words[-2].opaque_quoting
+
+    def test_continuations_do_not_create_argv_boundaries(self):
+        validator = SafetyValidator()
+        words = validator._parse_shell_commands('pri\\\nntf a\\\n"b" c\\\n d')[0]
+        assert [word.value for word in words] == ["printf", "ab", "c", "d"]
+        result = validator.validate("su\\\ndo --help")
+        assert not result.allowed
+        assert result.matched_pattern == "sudo"
+
+    def test_number_nodes_with_nested_commands_are_not_blindly_static(self):
+        # Some numeric forms have children: the node category is not proof
+        # that its entire spelling is a literal number.
+        nested = SimpleNamespace(
+            type="command_substitution", start_byte=1, end_byte=12
+        )
+        number = SimpleNamespace(
+            type="number", start_byte=0, end_byte=12, children=[nested]
+        )
+        word = SafetyValidator()._shell_word(number, b"1$(printf 2)")
+        assert word.value is None
+        assert word.dynamic
+
+    def test_unexpected_ast_kind_refuses_without_source_or_exception_chain(self):
+        node = SimpleNamespace(
+            type="SYNTHETIC_SECRET_CANARY", start_byte=0, end_byte=23,
+            start_point=(1, 4),
+        )
+        with pytest.raises(_UnsafeShellSyntax) as caught:
+            SafetyValidator()._shell_word(node, b"SYNTHETIC_SECRET_CANARY")
+        assert str(caught.value) == (
+            "cannot inspect shell word (stage=shell_word, scope=top_level, depth=0; "
+            "reported parser location: line 2, byte column 5)"
+        )
+        assert caught.value.__context__ is None
+        assert caught.value.__cause__ is None
+
+    def test_unknown_guard_uses_value_not_legacy_metadata(self):
+        with pytest.raises(_UnsafeShellSyntax, match="unknown command name"):
+            SafetyValidator()._effective_command([_ShellWord(None)])
+
+    @pytest.mark.parametrize("profile", ["strict", "standard", "permissive"])
+    @pytest.mark.parametrize("prefix", ["", "sh -c ", "eval "])
+    def test_original_nested_quote_fixture_is_positive_at_each_script_scope(
+        self, profile, prefix
+    ):
+        command = (
+            prefix + shlex.quote(_WORD_DECODER_SCRIPT)
+            if prefix else _WORD_DECODER_SCRIPT
+        )
+        assert SafetyValidator(profile=profile).validate(command).allowed
+
+    @pytest.mark.parametrize(
+        "script,executables",
+        [
+            (_WORD_DECODER_SCRIPT, ["printf", "printf"]),
+            ('printf "${X:-$(printf ok)}"', ["printf", "printf"]),
+            ("printf $((1+$(printf 2)))", ["printf", "printf"]),
+            ('printf $"$(printf data)"', ["printf", "printf"]),
+            ("X=$(printf x) printf ok", ["printf", "printf"]),
+            ("X=$(printf x)", ["printf"]),
+            ('printf ok >"$(printf target)"', ["printf", "printf"]),
+            ("cat <(printf data)", ["cat", "printf"]),
+            ("cat <<EOF\n$(printf data)\nEOF\n", ["cat", "printf"]),
+        ],
+    )
+    def test_collection_is_independent_of_outer_unknown_value(self, script, executables):
+        commands = SafetyValidator()._parse_shell_commands(script)
+        assert [words[0].value for words in commands] == executables
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            '''printf '%s' "$(sudo --help)"''',
+            "printf `sudo --help`",
+            "printf <(sudo --help)",
+            "printf $((1+$(sudo --help)))",
+            "printf 123$(sudo --help)",
+            'printf "${X:-$(sudo --help)}"',
+            'printf $"$(sudo --help)"',
+            "X=$(sudo --help) printf ok",
+            "X=$(sudo --help)",
+            'printf ok >"$(sudo --help)"',
+            "cat <<EOF\n$(sudo --help)\nEOF\n",
+        ],
+    )
+    def test_blocked_inner_commands_are_inspected(self, command):
+        result = SafetyValidator().validate(command)
+        assert not result.allowed
+        assert result.matched_pattern == "sudo"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "printf '$(sudo --help)'",
+            r"printf \$\(sudo\ --help\)",
+            "cat <<'EOF'\n$(sudo --help)\nEOF\n",
+        ],
+    )
+    def test_quoted_command_text_is_not_executed_or_collected(self, command):
+        validator = SafetyValidator()
+        assert validator.validate(command).allowed
+        assert len(validator._parse_shell_commands(command)) == 1
+
+
+@pytest.mark.parametrize("profile", ["strict", "standard", "permissive"])
+@pytest.mark.parametrize(
+    "unknown", ["$X", '"$X"', "$(printf x)", "$'x'", '$"x"', "*", "{a,b}", "~/x"]
+)
+@pytest.mark.parametrize(
+    "template",
+    [
+        "{} printf ok", "env {} printf ok", "env -u {} printf ok",
+        "env -C {} printf ok", "env A={} printf ok", "env -- A={} printf ok",
+        "command {} printf ok", "exec {} printf ok", "exec -a {} printf ok",
+        "nohup {} printf ok", "time {} printf ok", "time -f {} printf ok",
+        "time -o {} printf ok", "nice {} printf ok", "nice -n {} printf ok",
+        "setsid {} printf ok", "stdbuf {} printf ok", "stdbuf -o {} printf ok",
+        "env -- {}", "command -- {}", "exec -- {}", "nohup -- {}",
+        "time -- {}", "nice -- {}", "setsid -- {}", "stdbuf -- {}",
+        "env X=1 command -p exec -- nice -- {}",
+    ],
+)
+def test_all_wrapper_control_positions_require_known_values(profile, unknown, template):
+    # Includes dynamic/opaque options, consumed values, assignments, and each
+    # successive executable selected after -- or a nested wrapper.
+    command = template.format(unknown)
+    result = SafetyValidator(profile=profile).validate(command)
+    assert not result.allowed
+    assert result.matched_pattern == "<unsupported bash syntax>"
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "env -i -u X -C . A=1", "env -- A=1", "command -p --",
+        "exec -cl -a label --", "nohup --", "time -p -f '%s' -o result --",
+        "nice -n 10 --", "setsid -fw --", "stdbuf -o L --",
+        "env X=1 command -p exec -- nice --",
+    ],
+)
+def test_wrapper_guards_stop_at_the_actual_executable(prefix):
+    # Dynamic and opaque ordinary data remain usable after the real executable.
+    assert SafetyValidator().validate(prefix + ' printf "$X" $\'data\' $"data"').allowed
+    assert not SafetyValidator().validate(prefix + " rm -rf /").allowed
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "env --unknown printf ok", "command -Q printf ok", "exec -Q printf ok",
+        "nohup -Q printf ok", "time --unknown printf ok",
+        "env -u", "env -C", "exec -a", "time -f", "time -o",
+        "bash --unknown -c 'printf ok'", "bash -Z -c 'printf ok'",
+        "bash -Zc 'printf ok'",
+    ],
+)
+def test_unknown_or_missing_wrapper_options_are_not_guessed(command):
+    assert not SafetyValidator().validate(command).allowed
+
+
+@pytest.mark.parametrize("profile", ["strict", "standard", "permissive"])
+@pytest.mark.parametrize("shell", ["bash", "dash", "ksh", "sh", "zsh"])
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '$OPTIONS -c "printf ok"', '-o "$OPTION" -c "printf ok"',
+        '--rcfile "$RC" -c "printf ok"', '-c "$SCRIPT"', "-c $'printf ok'",
+        '-c $"printf ok"', "-o $'pipefail' -c 'printf ok'",
+    ],
+)
+def test_shell_control_words_and_scripts_require_known_values(profile, shell, arguments):
+    result = SafetyValidator(profile=profile).validate(shell + " " + arguments)
+    assert not result.allowed
+    assert result.matched_pattern == "<unsupported bash syntax>"
+
+
+@pytest.mark.parametrize("profile", ["strict", "standard", "permissive"])
+@pytest.mark.parametrize(
+    "arguments", ['$SCRIPT', '"$SCRIPT"', "'printf' $ARG", "$'printf ok'", '$"printf ok"']
+)
+def test_eval_requires_every_argument_known(profile, arguments):
+    assert not SafetyValidator(profile=profile).validate("eval " + arguments).allowed
+
+
+@pytest.mark.parametrize("profile", ["strict", "standard", "permissive"])
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '-rf "$TARGET"', "-rf $HOME", "-rf ${HOME}/.", "-rf ~",
+        "-rf *", "-rf ./[ab]", "-rf {a,b}", "-rf {1..3}",
+        "-rf $(printf ./build)", "-rf <(printf ./build)", "-rf $((1+2))",
+        "$FLAGS ./build", '"-$FLAGS" ./build', "-r${FLAG} ./build",
+        "-rf $'./build'", '-rf $"./build"', '-rf -- "$TARGET"', "-- $FLAGS",
+        '"$TARGET"', "-f ./build $OTHER",
+    ],
+)
+def test_all_rm_arguments_require_known_values_including_permissive(profile, arguments):
+    # Intentional tightening, including permissive HOME and all rm flags/data:
+    # unknown expansion results are not safely comparable to root/home literals.
+    validator = SafetyValidator(profile=profile)
+    result = validator.validate("rm " + arguments)
+    assert not result.allowed
+    assert result.matched_pattern == "<unsupported bash syntax>"
+    assert "unknown rm argument" in result.reason
+    assert result.hint == _SYNTAX_HINT
+    assert validator.validate("rm -rf ./build").allowed
+
+
+@pytest.mark.parametrize("profile", ["strict", "standard"])
+@pytest.mark.parametrize("target", ["'~'", "'$HOME'", "'${HOME}/.'", "'/tmp/..'"])
+def test_static_root_and_home_literal_checks_are_preserved(profile, target):
+    result = SafetyValidator(profile=profile).validate("rm -rf " + target)
+    assert not result.allowed
+    assert result.matched_pattern != "<unsupported bash syntax>"
+
+
+@pytest.mark.parametrize("argument", ['$FLAG', '"$FLAG"', "$'-'", '$"-"'])
+def test_generic_command_pattern_arguments_require_known_values(argument):
+    command = "su " + argument
+    validator = SafetyValidator()
+    # Parsing succeeds: the critical argument guard raises during pattern checking.
+    assert validator._parse_shell_commands(command)[0][1].value is None
+    result = validator.validate(command)
+    assert not result.allowed
+    assert result.matched_pattern == "<unsupported bash syntax>"
+    assert "unknown blocked command argument" in result.reason
+
+
+def test_unknown_argument_cannot_rule_out_a_longer_command_pattern():
+    validator = SafetyValidator()
+    validator.profile = safety_module.SafetyProfile(
+        name="synthetic",
+        blocked_patterns=[
+            safety_module.BlockPattern("sample -a -b", "synthetic policy", "command")
+        ],
+    )
+    result = validator.validate('sample "$FLAGS"')
+    assert not result.allowed
+    assert result.matched_pattern == "<unsupported bash syntax>"
+    assert "unknown blocked command argument" in result.reason
+    assert validator.validate('printf "$FLAGS"').allowed
+
+
+def test_postparse_refusal_does_not_disclose_unknown_rm_source():
+    result = SafetyValidator().validate('rm -rf "$SYNTHETIC_SECRET_CANARY"')
+    assert not result.allowed
+    assert result.matched_pattern == "<unsupported bash syntax>"
+    for field in (result.reason, result.matched_pattern, result.hint):
+        assert "SYNTHETIC_SECRET_CANARY" not in field
+
+
+class TestSyntaxDiagnostics:
+    @pytest.mark.parametrize("profile", ["strict", "standard", "permissive"])
+    @pytest.mark.parametrize(
+        "command,stage,location",
+        [
+            (_INVALID_SCRIPT, "tree_parse", "line 1, byte column 1; node=ERROR"),
+            (_MULTIPLE_HEREDOCS, "tree_parse", "line 1, byte column 14; node=ERROR"),
+        ],
+    )
+    def test_diagnostic_stage_and_reported_location(
+        self, profile, command, stage, location
+    ):
+        result = SafetyValidator(profile=profile).validate(command)
+        assert not result.allowed
+        assert result.reason.startswith("Unable to safely analyze Bash syntax:")
+        assert f"stage={stage}, scope=top_level, depth=0" in result.reason
+        assert f"reported parser location: {location}" in result.reason
+        assert result.matched_pattern == "<unsupported bash syntax>"
+        assert result.hint == _SYNTAX_HINT
+        assert "unrestricted" not in result.hint
+        assert set(vars(result)) == {"allowed", "reason", "matched_pattern", "hint"}
+
+    def test_nested_quote_decoder_regression_is_now_supported(self):
+        # Preserve the original fixture bytes: this was a decoder failure, not
+        # invalid Bash. Its negative diagnostic assertions move to fault injection.
+        root = safety_module.Parser(safety_module._BASH_LANGUAGE).parse(
+            _WORD_DECODER_SCRIPT.encode()
+        ).root_node
+        assert not root.has_error
+        result = SafetyValidator().validate(_WORD_DECODER_SCRIPT)
+        assert result == SafetyResult(allowed=True)
+        commands = SafetyValidator()._parse_shell_commands(_WORD_DECODER_SCRIPT)
+        assert [[word.value for word in words] for words in commands] == [
+            ["printf", "%s", None], ["printf", "'"],
+        ]
+        assert commands[0][2].dynamic
+
+    @pytest.mark.parametrize("scope,prefix", [("shell_c", "sh -c"), ("eval", "eval")])
+    @pytest.mark.parametrize(
+        "script,location",
+        [
+            (_INVALID_SCRIPT, "line 1, byte column 1; node=ERROR"),
+            (
+                "printf é; if true; then printf synthetic;",
+                "line 1, byte column 43; node=missing",
+            ),
+            (
+                "printf synthetic\nif true; then printf synthetic;",
+                "line 2, byte column 32; node=missing",
+            ),
+        ],
+    )
+    def test_diagnostic_nested_coordinates_use_current_script(
+        self, scope, prefix, script, location
+    ):
+        # Eval deliberately receives two arguments, whose joined text is script.
+        arguments = script.split(" ", 1) if scope == "eval" else [script]
+        command = prefix + " " + " ".join(shlex.quote(arg) for arg in arguments)
+        result = SafetyValidator().validate(command)
+        assert not result.allowed
+        assert f"stage=tree_parse, scope={scope}, depth=1" in result.reason
+        position, node = location.split("; node=")
+        assert f"reported parser location: {position}" in result.reason
+        assert f"; node={node}" in result.reason
+        coordinates = (
+            "decoded nested script" if scope == "shell_c" else "joined eval arguments"
+        )
+        assert f"coordinates within {coordinates}" in result.reason
+
+    @pytest.mark.parametrize("scope,prefix", [("shell_c", "sh -c"), ("eval", "eval")])
+    def test_diagnostic_nested_word_scope_and_actual_depth(self, scope, prefix):
+        inner = prefix + " " + shlex.quote(_WORD_DECODER_SCRIPT)
+        validator = SafetyValidator()
+        decode = validator._decode_word_node
+
+        def unknown_node(node, source):
+            # The real fixture now succeeds. Inject the unsupported-AST stage
+            # only in the innermost script to retain scope/depth coverage.
+            if source == _WORD_DECODER_SCRIPT.encode() and node.start_byte == 12:
+                raise ValueError("synthetic unsupported word node")
+            return decode(node, source)
+
+        with patch.object(validator, "_decode_word_node", side_effect=unknown_node):
+            result = validator.validate("sh -c " + shlex.quote(inner))
+        assert not result.allowed
+        assert f"stage=shell_word, scope={scope}, depth=2" in result.reason
+        assert "reported parser location: line 1, byte column 13" in result.reason
+        coordinates = (
+            "decoded nested script" if scope == "shell_c" else "joined eval arguments"
+        )
+        assert f"coordinates within {coordinates}" in result.reason
+
+    def test_diagnostic_unicode_column_counts_bytes_not_characters(self):
+        command = "printf é; if true; then printf synthetic;"
+        assert len(command) + 1 == 42
+        assert len(command.encode()) + 1 == 43
+        first = SafetyValidator().validate(command)
+        assert "line 1, byte column 43; node=missing" in first.reason
+        assert SafetyValidator().validate(command) == first
+
+    def test_diagnostic_depth_limit_is_unchanged(self):
+        validator = SafetyValidator()
+        assert validator.validate("eval " * 10 + "printf synthetic").allowed
+        result = validator.validate("eval " * 11 + "printf synthetic")
+        assert not result.allowed
+        assert "stage=nesting_depth, scope=eval, depth=11" in result.reason
+        assert "reported parser location" not in result.reason
+
+    def test_diagnostic_preorder_includes_anonymous_missing_tokens(self):
+        missing = SimpleNamespace(type="fi", is_missing=True, start_point=(2, 4))
+        branch = SimpleNamespace(
+            type="if_statement",
+            is_missing=False,
+            children=[missing],
+            named_children=[],
+        )
+        later_error = SimpleNamespace(
+            type="ERROR", is_missing=False, start_point=(0, 0)
+        )
+        root = SimpleNamespace(
+            has_error=True,
+            type="program",
+            is_missing=False,
+            children=[branch, later_error],
+            named_children=[branch, later_error],
+        )
+        validator = SafetyValidator()
+        with (
+            patch.object(safety_module, "Parser") as parser,
+            patch.object(validator, "_collect_command_nodes") as collect,
+        ):
+            parser.return_value.parse.return_value.root_node = root
+            result = validator.validate("printf synthetic")
+            parser.return_value.parse.assert_called_once_with(b"printf synthetic")
+        assert not result.allowed
+        assert "line 3, byte column 5; node=missing" in result.reason
+        assert "node=fi" not in result.reason
+        collect.assert_not_called()
+
+    @pytest.mark.parametrize("fault", ["children", "location", "no_error_node"])
+    def test_diagnostic_extraction_failure_keeps_generic_refusal(self, fault):
+        root = Mock(has_error=True, type="program", is_missing=False, children=[])
+        if fault == "children":
+            type(root).children = PropertyMock(
+                side_effect=RuntimeError("synthetic-canary")
+            )
+        elif fault == "location":
+            node = Mock(type="ERROR", is_missing=False)
+            type(node).start_point = PropertyMock(
+                side_effect=RuntimeError("synthetic-canary")
+            )
+            root.children = [node]
+        validator = SafetyValidator()
+        with (
+            patch.object(safety_module, "Parser") as parser,
+            patch.object(validator, "_collect_command_nodes") as collect,
+        ):
+            parser.return_value.parse.return_value.root_node = root
+            result = validator.validate("printf synthetic")
+        assert not result.allowed
+        assert result.reason == (
+            "Unable to safely analyze Bash syntax: invalid or unsupported Bash syntax"
+        )
+        assert result.matched_pattern == "<unsupported bash syntax>"
+        assert result.hint == _SYNTAX_HINT
+        collect.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "if true; then printf SYNTHETIC_SECRET_CANARY;",
+            _MULTIPLE_HEREDOCS.replace("one", "SYNTHETIC_SECRET_CANARY"),
+            # The old nested-quote canary is now supported. An unknown env
+            # control word retains this negative source-privacy assertion.
+            'env "$SYNTHETIC_SECRET_CANARY" printf synthetic',
+            "nice --SYNTHETIC_SECRET_CANARY printf synthetic",
+            "$SYNTHETIC_SECRET_CANARY",
+        ],
+    )
+    def test_diagnostic_results_and_private_exceptions_do_not_copy_source(
+        self, command
+    ):
+        validator = SafetyValidator()
+        result = validator.validate(command)
+        assert not result.allowed
+        for field in (result.reason, result.matched_pattern, result.hint):
+            assert "SYNTHETIC_SECRET_CANARY" not in field
+        with pytest.raises(_UnsafeShellSyntax) as caught:
+            validator._parse_shell_commands(command)
+        exc = caught.value
+        for rendered in (str(exc), repr(exc), repr(vars(exc)), repr(exc.args)):
+            assert "SYNTHETIC_SECRET_CANARY" not in rendered
+
+    def test_diagnostic_decoder_exception_text_is_never_forwarded(self):
+        validator = SafetyValidator()
+        with patch.object(
+            validator, "_decode_literal_fragment",
+            side_effect=ValueError("SYNTHETIC_SECRET_CANARY"),
+        ):
+            result = validator.validate("printf synthetic")
+            with pytest.raises(_UnsafeShellSyntax) as caught:
+                validator._parse_shell_commands("printf synthetic")
+        assert "stage=shell_word" in result.reason
+        assert caught.value.__context__ is None
+        assert caught.value.__cause__ is None
+        for rendered in (
+            result.reason,
+            result.matched_pattern,
+            result.hint,
+            str(caught.value),
+            repr(caught.value),
+            repr(vars(caught.value)),
+        ):
+            assert "SYNTHETIC_SECRET_CANARY" not in rendered
+
+    def test_diagnostic_word_location_failure_still_refuses(self):
+        node = Mock(type="synthetic_unknown", start_byte=0, end_byte=1)
+        type(node).start_point = PropertyMock(
+            side_effect=RuntimeError("SYNTHETIC_SECRET_CANARY")
+        )
+        with pytest.raises(_UnsafeShellSyntax) as caught:
+            SafetyValidator()._shell_word(node, b"'", scope="shell_c", depth=2)
+        assert str(caught.value) == (
+            "cannot inspect shell word (stage=shell_word, scope=shell_c, depth=2)"
+        )
+        assert caught.value.__context__ is None
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "nice --unknown printf synthetic",
+            "$SYNTHETIC",
+            "sh -c \"$SYNTHETIC\"",
+            "eval \"$SYNTHETIC\"",
+            "sh -o",
+        ],
+    )
+    def test_diagnostic_policy_ambiguity_is_not_mislabeled_as_grammar(self, command):
+        result = SafetyValidator().validate(command)
+        assert not result.allowed
+        assert "stage=tree_parse" not in result.reason
+        assert "reported parser location" not in result.reason
+
+    @pytest.mark.parametrize(
+        "command", [_INVALID_SCRIPT, _MULTIPLE_HEREDOCS, _WORD_DECODER_SCRIPT]
+    )
+    @pytest.mark.parametrize(
+        "profile", ["strict", "standard", "permissive", "unrestricted"]
+    )
+    @pytest.mark.parametrize("grant", ["none", "allowlist", "override"])
+    def test_diagnostic_existing_profile_and_override_admission_is_unchanged(
+        self, command, profile, grant
+    ):
+        config = SafetyConfig(
+            profile=profile,
+            allowed_commands=[command] if grant == "allowlist" else [],
+            denied_commands=[command],
+            safety_overrides={
+                "allow": [command] if grant == "override" else [],
+                "block": [command],
+            },
+        )
+        result = SafetyValidator(profile=profile, config=config).validate(command)
+        expected = profile == "unrestricted" or (profile != "strict" and grant != "none")
+        assert result.allowed == expected
+        if expected:
+            assert result == SafetyResult(allowed=True)
+        elif command == _WORD_DECODER_SCRIPT:
+            # Supported input still reaches configured deny/block patterns.
+            assert result.matched_pattern == command
+
+    def test_diagnostic_normal_policy_hint_is_unchanged(self):
+        result = SafetyValidator().validate("sudo printf synthetic")
+        assert not result.allowed
+        assert result.matched_pattern == "sudo"
+        assert result.hint == (
+            "Use safety_profile: 'permissive' or 'unrestricted' for container/VM environments"
+        )
+
+    @pytest.mark.parametrize(
+        "script,executables",
+        [
+            ("cat <<'EOF'\nprintf synthetic\n$(printf synthetic)\nEOF\n", ["cat"]),
+            ("cat <<EOF\nprintf synthetic\nEOF\n", ["cat"]),
+            ("cat <<EOF\n$(printf synthetic)\nEOF\n", ["cat", "printf"]),
+        ],
+    )
+    def test_diagnostic_patch_preserves_heredoc_command_collection(
+        self, script, executables
+    ):
+        validator = SafetyValidator()
+        assert validator.validate(script).allowed
+        commands = validator._parse_shell_commands(script)
+        assert [words[0].value for words in commands] == executables
+
+    def test_dynamic_shell_word_has_no_raw_value_fallback(self):
+        commands = SafetyValidator()._parse_shell_commands("printf $(printf synthetic)")
+        # Intentional tightening: raw syntax is not the command's actual value.
+        assert commands[0][1].value is None
+        assert commands[0][1].dynamic
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    # The nested-quote fixture is now positive and must never enter this seam.
+    "command",
+    [_INVALID_SCRIPT, _MULTIPLE_HEREDOCS, 'rm -rf "$SYNTHETIC"', "sh -c $'printf ok'"],
+)
+@pytest.mark.parametrize("run_in_background", [False, True])
+async def test_syntax_diagnostics_never_reach_ordinary_subprocess_seams(
+    command, run_in_background
+):
+    tool = BashTool({"safety_profile": "strict"})
+    safety = tool._safety_validator.validate(command)
+    with (
+        patch(
+            "amplifier_module_tool_bash.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock, side_effect=AssertionError("unexpected spawn"),
+        ) as spawn_exec,
+        patch(
+            "amplifier_module_tool_bash.asyncio.create_subprocess_shell",
+            new_callable=AsyncMock, side_effect=AssertionError("unexpected spawn"),
+        ) as spawn_shell,
+        patch(
+            "amplifier_module_tool_bash.subprocess.Popen",
+            side_effect=AssertionError("unexpected spawn"),
+        ) as popen,
+    ):
+        result = await tool.execute(
+            {"command": command, "run_in_background": run_in_background}
+        )
+    assert not result.success
+    assert safety.reason in result.error["message"]
+    assert safety.hint == _SYNTAX_HINT
+    assert safety.hint in result.error["message"]
+    assert result.output == result.error["message"]
+    assert tool._active_commands == 0
+    spawn_exec.assert_not_called()
+    spawn_shell.assert_not_called()
+    popen.assert_not_called()
 
 
 @pytest.mark.parametrize("managed", [False, True])
