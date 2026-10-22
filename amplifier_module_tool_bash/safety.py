@@ -506,7 +506,10 @@ class SafetyValidator:
             quote = None
             while cursor < end:
                 char = source[cursor : cursor + 1]
-                if lexical_quotes and quote == b"'":
+                if lexical_quotes and quote in {b"'", b"$'"}:
+                    if quote == b"$'" and char == b"\\":
+                        cursor += 2
+                        continue
                     if char == b"'":
                         quote = None
                     cursor += 1
@@ -540,6 +543,13 @@ class SafetyValidator:
                         and source[following : following + 2] == b"\\\n"
                     ):
                         following += 2
+                    if (
+                        lexical_quotes and quote is None
+                        and source[following : following + 1] == b"'"
+                    ):
+                        quote = b"$'"
+                        cursor = following + 1
+                        continue
                     if source[following : following + 1] == b"$":
                         # Continuations do not split the logical PID token.
                         cursor = following + 1

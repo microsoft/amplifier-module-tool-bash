@@ -37,6 +37,8 @@ _WORD_DECODER_SCRIPT = '''printf '%s' "$(printf "'")"'''
 _CONTINUED_SUBSTITUTION = "$" + chr(92) + chr(10) + "(printf SYNTHETIC_MARKER)"
 _CONTINUED_PARAMETER_OPERAND = "${SYNTHETIC_UNSET:-" + _CONTINUED_SUBSTITUTION + "}"
 _CONTINUED_REGEX = "[[ x =~ " + _CONTINUED_SUBSTITUTION + " ]]"
+_ANSI_REGEX_PREFIX = "$'a" + chr(92) + "'b'"
+_CONTINUED_ANSI_REGEX = "[[ x =~ " + _ANSI_REGEX_PREFIX + _CONTINUED_SUBSTITUTION + " ]]"
 
 
 class TestContinuedExpansion:
@@ -130,6 +132,29 @@ class TestContinuedExpansion:
         dollars = "$" + (self.continuation if separated else "") + "$"
         command = "[[ x =~ " + dollars + self.continuation + "(literal) ]]"
         assert SafetyValidator().validate(command).allowed
+
+    @pytest.mark.parametrize("profile", ["strict", "standard", "permissive"])
+    @pytest.mark.parametrize("continued_prefix", [False, True])
+    def test_ansi_regex_quote_escape_does_not_hide_active_dollar(
+        self, profile, continued_prefix
+    ):
+        prefix = _ANSI_REGEX_PREFIX
+        if continued_prefix:
+            prefix = "$" + self.continuation + prefix[1:]
+        command = "[[ x =~ " + prefix + self.split_substitution + " ]]"
+        result = SafetyValidator(profile=profile).validate(command)
+        assert not result.allowed
+        assert "stage=continuation_expansion" in result.reason
+        assert result.hint == _SYNTAX_HINT
+
+    @pytest.mark.parametrize("profile", ["strict", "standard", "permissive"])
+    @pytest.mark.parametrize("include_split", [False, True])
+    def test_ansi_regex_escaped_quote_retains_literal_content(self, profile, include_split):
+        content = _ANSI_REGEX_PREFIX[:-1]
+        if include_split:
+            content += self.split_substitution
+        command = "[[ x =~ " + content + "' ]]"
+        assert SafetyValidator(profile=profile).validate(command).allowed
 
     @pytest.mark.parametrize("context", ["bare", "outer_string", "heredoc"])
     def test_nested_command_resets_inherited_parameter_quote_context(self, context):
@@ -933,6 +958,7 @@ class TestSyntaxDiagnostics:
         "echo " + _CONTINUED_PARAMETER_OPERAND,
         "cat <<EOF\nprefix " + _CONTINUED_PARAMETER_OPERAND + "\nEOF\n",
         _CONTINUED_REGEX,
+        _CONTINUED_ANSI_REGEX,
     ],
 )
 @pytest.mark.parametrize("run_in_background", [False, True])

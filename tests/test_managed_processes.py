@@ -435,6 +435,7 @@ async def test_managed_start_uses_same_shell_validator():
         "echo ${X:-$" + chr(92) + chr(10) + "(printf SYNTHETIC_MARKER)}",
         "cat <<EOF\n${X:-$" + chr(92) + chr(10) + "(printf SYNTHETIC_MARKER)}\nEOF\n",
         "[[ x =~ $" + chr(92) + chr(10) + "(printf SYNTHETIC_MARKER) ]]",
+        "[[ x =~ $'a" + chr(92) + "'b'$" + chr(92) + chr(10) + "(printf SYNTHETIC_MARKER) ]]",
     ],
 )
 @pytest.mark.parametrize("pty", [False, True])
