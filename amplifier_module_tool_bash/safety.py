@@ -434,6 +434,15 @@ class SafetyValidator:
                 pass
             raise failure
 
+        continued = self._find_continued_expansion(root, source)
+        if continued is not None:
+            raise _UnsafeShellSyntax(
+                "continuation-split expansion cannot be inspected",
+                stage="continuation_expansion", scope=scope, depth=depth,
+                line=source.count(b"\n", 0, continued) + 1,
+                byte_column=continued - source.rfind(b"\n", 0, continued),
+            )
+
         parsed_commands: list[list[_ShellWord]] = []
         self._collect_command_nodes(
             root, source, parsed_commands, scope=scope, depth=depth
@@ -472,6 +481,115 @@ class SafetyValidator:
                     )
 
         return parsed_commands + nested_commands
+
+    def _find_continued_expansion(self, root: Node, source: bytes) -> int | None:
+        """Refuse split expansion introducers the grammar can classify as data.
+
+        Inspect raw token boundaries before literal decoding removes escapes.
+        Quoted/escaped dollars in lexical content are not active dollar tokens.
+        Walk independently of word decoding, including beneath dynamic parents.
+        """
+        def split_at(offset: int, end: int) -> bool:
+            cursor = offset + 1
+            while cursor + 2 <= end and source[cursor : cursor + 2] == b"\\\n":
+                cursor += 2
+            return (
+                cursor > offset + 1
+                and cursor < end
+                and source[cursor : cursor + 1] in {b"(", b"{"}
+            )
+
+        def scan_range(start: int, end: int) -> int | None:
+            cursor = start
+            while cursor < end:
+                if (
+                    source[cursor : cursor + 1] == b"\\"
+                    and source[cursor + 1 : cursor + 2] in {b"\\", b"$", b"`", b"\n"}
+                ):
+                    cursor += 2
+                    continue
+                if source[cursor : cursor + 1] == b"$":
+                    following = cursor + 1
+                    while (
+                        following + 2 <= end
+                        and source[following : following + 2] == b"\\\n"
+                    ):
+                        following += 2
+                    if source[following : following + 1] == b"$":
+                        # Continuations do not split the logical PID token.
+                        cursor = following + 1
+                        continue
+                if source[cursor : cursor + 1] == b"$" and split_at(cursor, end):
+                    return cursor
+                cursor += 1
+            return None
+
+        pending = [(root, False, False)]
+        while pending:
+            node, operand, quoted = pending.pop()
+            if node.type in {"command_substitution", "process_substitution"}:
+                # Nested shell commands establish their own quoting context.
+                operand = quoted = False
+            elif node.type in {"string", "heredoc_body"}:
+                quoted = True
+            if node.type == "expansion":
+                operand = True
+            if node.type == "heredoc_redirect":
+                delimiter = next(
+                    (child for child in node.children if child.type == "heredoc_start"),
+                    None,
+                )
+                if delimiter is not None:
+                    spelling = source[delimiter.start_byte : delimiter.end_byte]
+                    spelling = spelling.replace(b"\\\n", b"")
+                    if any(marker in spelling for marker in (b"'", b'"', b"\\")):
+                        # Bash disables body expansion if ANY delimiter part is
+                        # quoted, even when the grammar treats it as active.
+                        pending.extend(
+                            reversed([
+                                (child, operand, quoted) for child in node.children
+                                if child.type != "heredoc_body"
+                            ])
+                        )
+                        continue
+            if node.type == "heredoc_body":
+                # A prefixed dollar can remain inside opaque heredoc content.
+                # Scan literal regions, not the source of recognized expansions:
+                # quotes inside those nested commands have their own semantics.
+                start = node.start_byte
+                regions = []
+                for child in node.named_children:
+                    if child.type != "heredoc_content":
+                        regions.append((start, child.start_byte))
+                        start = child.end_byte
+                regions.append((start, node.end_byte))
+                for start, end in regions:
+                    found = scan_range(start, end)
+                    if found is not None:
+                        return found
+            if operand and not node.children and (
+                node.type in {"word", "regex"}
+                or (quoted and node.type in {"raw_string", "ansi_c_string"})
+            ):
+                # The grammar can hide an active introducer in a parameter
+                # operand's fallback word. Apostrophes inside an inherited
+                # double-quoted context do not make that operand literal.
+                found = scan_range(node.start_byte, node.end_byte)
+                if found is not None:
+                    return found
+            if node.type in {"string", "simple_expansion"}:
+                for child in node.children:
+                    if (
+                        child.type != "$"
+                        or source[child.start_byte : child.end_byte] != b"$"
+                    ):
+                        continue
+                    if split_at(child.start_byte, len(source)):
+                        return child.start_byte
+            pending.extend(
+                (child, operand, quoted) for child in reversed(node.children)
+            )
+        return None
 
     def _collect_command_nodes(
         self,
