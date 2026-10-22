@@ -932,7 +932,9 @@ Constraints:
 - Commands time out after 30 seconds by default; pass `timeout` to increase it for builds, tests, or monitoring, and `run_in_background` for indefinite processes (dev servers, watchers).
 - Interactive commands (-i flags, editors requiring input) are not supported and will fail.
 - Destructive commands (rm -rf /, sudo rm, etc.) are blocked.
-- Quote paths containing spaces (cd "/path/with spaces"), prefer absolute paths, chain dependent commands with && (mkdir foo && cd foo)."""
+- Spell executable names or paths literally, including executables invoked through wrappers and command words inside nested shell scripts. Use quoted variables for data arguments and environment values; keep shell code literal. These rules apply to ordinary execution and managed start. All configured checks still apply.
+- Example: `TEST_DIR="tests/unit"; ./.venv/bin/python -m pytest "$TEST_DIR"`.
+- Quote paths containing spaces (cd "/path/with spaces"), use absolute paths or literal relative paths, chain dependent commands with && (mkdir foo && cd foo)."""
 
     # Default output limit: ~100KB (roughly 25k tokens)
     DEFAULT_MAX_OUTPUT_BYTES = 100_000

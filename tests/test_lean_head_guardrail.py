@@ -13,10 +13,9 @@ grows back.
 So this file pins the description three ways, each catching a different
 regression:
 
-1. BYTE PIN -- `BashTool.description` is byte-for-byte the v1 text, vendored
-   verbatim at `tests/data/v1_bash_description.txt` from
-   `probes/bji-lean-head/v1_tools.json` (key `bash`).
-2. CHAR BUDGET -- a PER-ARTIFACT budget of 1,318 characters. Deliberately not
+1. BYTE PINS -- retain the historical v1 fixture and separately pin the shipped
+   description with its supported-command guidance.
+2. CHAR BUDGET -- a PER-ARTIFACT budget of 1,741 characters. Deliberately not
    a whole-head absolute: `zc6t` measured a real head at 320,410 chars against
    a 48,249 threshold that described an eval container's 14-tool bundle
    composition, not the product's 86. A whole-head number is not a fact about
@@ -64,11 +63,12 @@ VENDORED_PATH = Path(__file__).parent / "data" / "v1_bash_description.txt"
 
 # sha256 of the vendored file's TEXT, utf-8 encoded (see LINE ENDINGS above).
 # Pinned so the fixture cannot be quietly rewritten to match a description that
-# has drifted. This is also the sha256 of the shipped description.
+# has drifted. The shipped description has a separate pin below.
 VENDORED_SHA256 = "75f3577ad0cb859918b8360b13c3ff3bfaa1270e0a604495a21a0da491083cba"
 
-# Per-artifact budget. Stock was 1,997 chars; lean is 1,318 (679 saved).
-CHAR_BUDGET = 1318
+# V1 remains 1,318 chars. Supported-command guidance adds 423 chars.
+SHIPPED_SHA256 = "c46fe9c65b4feef3818e836ed8863691b6f666ec73e82c59e538304c743b04e9"
+CHAR_BUDGET = 1741
 
 # Every rule, constraint, command and pointer present in the stock text. Each
 # must survive verbatim in whatever the description says today. This list was
@@ -126,23 +126,15 @@ def test_vendored_slice_is_intact():
         "it upstream in v1_tools.json first, then re-vendor -- do not edit the "
         "fixture to match a drifted description."
     )
-    assert len(_vendored_text()) == CHAR_BUDGET
+    assert len(_vendored_text()) == 1318
 
 
-def test_description_is_byte_identical_to_v1():
-    """`BashTool.description` is byte-for-byte the v1 lean text."""
-    expected = _vendored_text()
+def test_shipped_description_preserves_v1_except_command_guidance():
+    """Only the command-writing section differs from the historical fixture."""
+    prefix = _vendored_text().rsplit("- Quote paths", 1)[0]
     actual = BashTool.description
-    assert actual == expected, (
-        "BashTool.description has drifted from the pinned v1 lean text.\n"
-        f"  expected {len(expected)} chars, sha256 "
-        f"{hashlib.sha256(expected.encode()).hexdigest()}\n"
-        f"  actual   {len(actual)} chars, sha256 "
-        f"{hashlib.sha256(actual.encode()).hexdigest()}\n"
-        "This text is billed on every request of every session. If the change "
-        "is intended, update tests/data/v1_bash_description.txt AND its sha256 "
-        "pin above, and state the new char count in the PR body."
-    )
+    assert actual.startswith(prefix)
+    assert hashlib.sha256(actual.encode("utf-8")).hexdigest() == SHIPPED_SHA256
 
 
 def test_description_within_char_budget():
@@ -150,8 +142,7 @@ def test_description_within_char_budget():
     actual = len(BashTool.description)
     assert actual == CHAR_BUDGET, (
         f"BashTool.description is {actual} chars; the pinned budget is "
-        f"{CHAR_BUDGET}. Stock was 1,997 chars before the lean-head change "
-        f"(679 saved). Every character here is paid on every request of every "
+        f"{CHAR_BUDGET}. Every character here is paid on every request of every "
         f"session, used or not."
     )
 

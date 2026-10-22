@@ -699,6 +699,23 @@ async def test_syntax_diagnostics_never_reach_ordinary_subprocess_seams(
     popen.assert_not_called()
 
 
+@pytest.mark.parametrize("managed", [False, True])
+def test_supported_command_guidance_is_visible_and_inspectable(managed):
+    tool = BashTool({"managed_processes": managed})
+    description = tool.description
+    for marker in (
+        "Spell executable names or paths literally",
+        "executables invoked through wrappers",
+        "Use quoted variables for data arguments and environment values",
+        "ordinary execution and managed start",
+        "All configured checks still apply",
+    ):
+        assert marker in description
+    example = description.split("- Example: `", 1)[1].split("`", 1)[0]
+    for profile in ("strict", "standard", "permissive"):
+        assert SafetyValidator(profile=profile).validate(example).allowed
+
+
 @pytest.mark.parametrize("profile", ["strict", "standard", "permissive"])
 @pytest.mark.parametrize(
     "prefix",
