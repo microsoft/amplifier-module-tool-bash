@@ -214,12 +214,18 @@ cannot be determined. This is command inspection, not an execution sandbox;
 the existing explicit allowlist and unrestricted-profile behavior still apply.
 
 Supported literal quoting is decoded from the Bash syntax tree, including
-literal fragments around nested command substitutions. Substitutions are
-inspected separately, never evaluated by the validator. Expansion-dependent or
-unsupported quoted values remain unknown: restricted profiles reject them in
-executable names, wrapper controls, shell/eval scripts, compared blocked-command
-arguments, and every `rm` argument. This can also reject legitimate deletions
-using variables or globs; it does not make the validator a general shell sandbox.
+literal fragments around nested command substitutions. Substitution nodes
+exposed by the grammar are traversed separately and never evaluated by the
+validator. This does not guarantee discovery of every substitution that Bash
+can execute: syntax-tree inspection is not complete Bash semantic equivalence.
+Report suspected security gaps privately through [SECURITY.md](SECURITY.md).
+
+Values identified as expansion-dependent or unsupported remain unknown.
+Restricted profiles reject unknown values in executable names, wrapper controls,
+shell/eval scripts, compared blocked-command arguments, and every `rm` argument.
+This can reject legitimate variable/glob deletions, tilde-prefixed executables,
+and dynamic operands of commands sharing a blocked command pattern. These
+conservative checks do not make the validator a general shell sandbox.
 
 Syntax refusals identify the analysis stage and, when available, the reported
 parser location using one-based UTF-8 byte columns. Nested script coordinates
