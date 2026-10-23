@@ -111,7 +111,11 @@ class ManagedProcesses:
                         "list",
                     ],
                     "default": "run",
-                    "description": "run preserves ordinary bash execution; start creates a session-owned pipe process. command is required only for run/start.",
+                    "description": "run waits for command completion; start returns a session-owned process handle. command is required only for run/start. Set start's timeout for its entire lifetime, not just startup.",
+                },
+                "timeout": {
+                    **schema["properties"]["timeout"],
+                    "description": f"run/start only: maximum process lifetime in seconds (default {self.tool.timeout}). wait_ms does not extend it.",
                 },
                 "pty": {
                     "type": "boolean",
@@ -143,7 +147,7 @@ class ManagedProcesses:
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 60000,
-                    "description": "wait blocks for new output or completion, bounded by this duration (default 1000). Does not terminate the process.",
+                    "description": "wait returns immediately for unread output; otherwise blocks for new output or completion, up to this duration (default 1000). Does not extend or cancel the process lifetime.",
                 },
                 "stdin": {
                     "type": "string",

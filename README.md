@@ -127,6 +127,29 @@ page = await session.call_tool("bash", {
 | `terminate` | `process_id`. Requests cancellation, cleans up the owned process group and waits for observation of the result. Repeating it after completion is harmless. |
 | `list` | Lists only processes owned by this mounted tool instance. |
 
+### Waiting efficiently
+
+Process lifetime and one wait call have separate budgets. `start` inherits the
+tool's 30-second default timeout unless configured otherwise or explicitly
+overridden at start. A later `wait_ms = 60000` does not extend that lifetime.
+Unread buffered output makes `wait` return immediately, even while the process
+is still running. Repeated progress or changing elapsed-time text can therefore
+wake the caller without a meaningful change in the watched job.
+
+When only a final result is needed, invoke ordinary `action = "run"` directly
+through the normal tool dispatcher with an explicit supported `timeout`
+(1–3600 seconds). It awaits command completion rather than returning each output
+chunk. Keep routine monitor progress in a task-owned bounded or rotated log,
+return a bounded terminal summary, and verify the exact external job identity
+and its final receipt. Do not wrap a long passive wait in a programmatic tool
+with a shorter wall-clock deadline; nested timeouts cannot extend that deadline.
+
+Timeout or cancellation cleans up the owned foreground process tree. It does
+not prove that an external job stopped or completed. `run_in_background` returns
+immediately and does not provide an automatic completion notification or durable
+watch. For work beyond one supported timeout, recheck the exact external job
+before explicitly renewing observation within the original authorized deadline.
+
 Follow-up actions reject `command`, `timeout`, and `run_in_background`, including
 an innocuous `command` added to match a shell auto-approval rule. Every action
 retains the tool name `bash`, approval metadata, and normal `tool:pre`/`tool:post`
