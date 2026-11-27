@@ -72,6 +72,14 @@ Execute a bash command with platform-appropriate shell.
   (WSL, if both are installed), falling back to well-known Git-for-Windows
   install locations if `PATH` resolves nothing.
 
+### Windows descendant identity
+
+The Windows orphan-protection sweep accepts a descendant only while it holds
+open handles to both parent and candidate, and the candidate's creation time
+is not before the parent's; it keeps verified handles until the sweep ends.
+Windows retains recorded parent IDs after exit and reuses IDs, so a recorded
+parent ID alone can incorrectly pull unrelated processes into a kill-on-close job.
+
 ## Configuration
 
 ```toml

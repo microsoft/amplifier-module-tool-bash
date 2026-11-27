@@ -463,11 +463,92 @@ def _assign_to_windows_job(pid: int) -> bool:
         return False
 
 
+class _WindowsProcessIdentity:
+    """An owned process handle that pins its PID until the sweep ends."""
+
+    def __init__(self, pid: int, handle, creation_time: int, kernel32) -> None:
+        self.pid = pid
+        self.handle = handle
+        self.creation_time = creation_time
+        self._kernel32 = kernel32
+
+    def close(self) -> None:
+        # The task's done callback also closes the root: a task cancelled before
+        # its coroutine's first step never enters that coroutine's finally.
+        if self.handle is not None:
+            handle, self.handle = self.handle, None
+            try:
+                self._kernel32.CloseHandle(handle)
+            except Exception as e:  # pragma: no cover - defensive DLL failure
+                logger.debug("tool-bash: process handle close failed (%s)", e)
+
+
+def _open_windows_process(pid: int) -> _WindowsProcessIdentity | None:
+    """Pin a PID and read its creation time, or fail closed without leaking."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        SYNCHRONIZE = 0x00100000
+        handle = kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid
+        )
+        if not handle:
+            return None
+        try:
+            creation, exit_time, kernel, user = (wintypes.FILETIME() for _ in range(4))
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                return None
+            identity = _WindowsProcessIdentity(
+                pid,
+                handle,
+                (creation.dwHighDateTime << 32) | creation.dwLowDateTime,
+                kernel32,
+            )
+            handle = None  # ownership transferred to identity
+            return identity
+        finally:
+            if handle is not None:
+                kernel32.CloseHandle(handle)
+    except Exception as e:
+        logger.debug("tool-bash: cannot pin/time Windows pid %s (%s)", pid, e)
+        return None
+
+
 def _enumerate_child_pids_windows(parent_pid: int) -> set[int]:
-    """Direct children of `parent_pid` via CreateToolhelp32Snapshot -- a
+    """Candidate children of `parent_pid` via CreateToolhelp32Snapshot -- a
     plain Win32 API walk of the system-wide process snapshot, filtered by
     th32ParentProcessID. No WMI/CIM, no PowerShell subprocess.
 
+    A recorded parent PID is NOT proof of descent: it survives parent exit and
+    PID reuse. Callers must pin and time both processes before accepting it.
     Windows-only. Returns an empty set on any failure or on other platforms.
     """
     if sys.platform != "win32":
@@ -542,6 +623,33 @@ def _enumerate_child_pids_windows(parent_pid: int) -> set[int]:
         return set()
 
 
+def _verified_windows_child(
+    parent: _WindowsProcessIdentity, child_pid: int
+) -> _WindowsProcessIdentity | None:
+    """Return an owned child identity only while both PIDs are pinned."""
+    if parent.handle is None:
+        return None
+    child = _open_windows_process(child_pid)
+    if child is None:
+        return None
+    try:
+        if child.creation_time < parent.creation_time:
+            return None
+        # The candidate PID could itself have been reused between the initial
+        # snapshot and OpenProcess. Recheck the recorded edge with BOTH handles
+        # held, so it cannot now name an unrelated, newer process.
+        if child_pid not in _enumerate_child_pids_windows(parent.pid):
+            return None
+        verified, child = child, None
+        return verified
+    finally:
+        if child is not None:
+            child.close()
+
+
+_WINDOWS_SWEEP_MAX_PROCESSES = 256  # includes the pinned root
+
+
 def _spawn_descendant_sweep(root_pid: int) -> None:
     """Start the descendant sweep and KEEP A REFERENCE to the task.
 
@@ -561,14 +669,30 @@ def _spawn_descendant_sweep(root_pid: int) -> None:
     timer structures probably keep it reachable. "Probably" is not a property
     worth betting a process-cleanup guarantee on, and a set costs nothing.
     """
-    task = asyncio.create_task(_protect_windows_descendants(root_pid))
+    # Synchronous: asyncio still owns the just-spawned process handle here.
+    # Waiting until the background task runs would permit root PID reuse.
+    root = _open_windows_process(root_pid)
+    if root is None:
+        return
+    sweep = _protect_windows_descendants(root)
+    try:
+        task = asyncio.create_task(sweep)
+    except BaseException:
+        sweep.close()
+        root.close()
+        raise
     _windows_sweep_tasks.add(task)
-    task.add_done_callback(_windows_sweep_tasks.discard)
+
+    def finished(task) -> None:
+        root.close()
+        _windows_sweep_tasks.discard(task)
+
+    task.add_done_callback(finished)
 
 
-async def _protect_windows_descendants(root_pid: int) -> None:
+async def _protect_windows_descendants(root: _WindowsProcessIdentity) -> None:
     """Best-effort background task (GAP-013/GAP-028): assign every
-    descendant of `root_pid` to the same kill-on-close job object, not
+    verified descendant of `root.pid` to the same kill-on-close job object, not
     just the immediate spawned PID.
 
     Why this exists: `_assign_to_windows_job(process.pid)` alone was found
@@ -594,27 +718,40 @@ async def _protect_windows_descendants(root_pid: int) -> None:
     changed. This function makes the protection deliberate instead of
     coincidental: it walks the process tree (root_pid's children, and
     their children) with a few short retries -- the WSL tree takes a
-    moment to fully spawn -- and assigns every PID it finds to the job
+    moment to fully spawn -- and assigns every verified descendant to the job
     too, so the kill-on-close guarantee no longer depends on an external,
     unverified assumption about WSL's behavior.
 
     Fire-and-forget: runs concurrently with the command's own
     process.communicate(), never blocks or delays the tool call, and
-    never raises (every failure path is caught and logged at debug only,
-    same contract as _assign_to_windows_job itself).
+    logs failures without failing the tool call. Cancellation propagates after
+    handle cleanup; reaching the handle bound stops with one warning.
     """
-    if sys.platform != "win32":
-        return
+    # Keep every identity, including exited processes and failed job assignments,
+    # pinned until the ENTIRE walk ends. Assignment success is not ancestry proof.
+    seen: dict[int, _WindowsProcessIdentity] = {root.pid: root}
     try:
-        seen: set[int] = {root_pid}
         for _ in range(8):  # poll for up to ~2s while the tree spawns
-            frontier = list(seen)
+            frontier = list(seen.values())
             new_found = False
-            for pid in frontier:
-                for child in _enumerate_child_pids_windows(pid):
-                    if child not in seen:
-                        seen.add(child)
-                        _assign_to_windows_job(child)
+            for parent in frontier:
+                if parent.handle is None:
+                    continue
+                for child_pid in sorted(_enumerate_child_pids_windows(parent.pid)):
+                    if child_pid not in seen:
+                        if len(seen) >= _WINDOWS_SWEEP_MAX_PROCESSES:
+                            logger.warning(
+                                "tool-bash: Windows descendant sweep reached %s "
+                                "processes; stopping (remaining descendants may "
+                                "not be job-protected)",
+                                _WINDOWS_SWEEP_MAX_PROCESSES,
+                            )
+                            return
+                        child = _verified_windows_child(parent, child_pid)
+                        if child is None:
+                            continue
+                        seen[child_pid] = child
+                        _assign_to_windows_job(child_pid)
                         new_found = True
             if not new_found and len(seen) > 1:
                 break  # tree grew at least once, then stopped changing
@@ -622,9 +759,12 @@ async def _protect_windows_descendants(root_pid: int) -> None:
     except Exception as e:  # pragma: no cover - defense in depth only
         logger.debug(
             "tool-bash: descendant job-protection sweep failed for %s (%s)",
-            root_pid,
+            root.pid,
             e,
         )
+    finally:
+        for identity in seen.values():
+            identity.close()
 
 
 # --- Windows shell resolution: Git Bash discoverability + observability --
