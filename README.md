@@ -72,13 +72,16 @@ Execute a bash command with platform-appropriate shell.
   (WSL, if both are installed), falling back to well-known Git-for-Windows
   install locations if `PATH` resolves nothing.
 
-### Windows descendant identity
+### Windows orphan protection
 
-The Windows orphan-protection sweep accepts a descendant only while it holds
-open handles to both parent and candidate, and the candidate's creation time
-is not before the parent's; it keeps verified handles until the sweep ends.
-Windows retains recorded parent IDs after exit and reuses IDs, so a recorded
-parent ID alone can incorrectly pull unrelated processes into a kill-on-close job.
+Foreground Windows commands start suspended, are assigned to the kill-on-close
+job, then resume, so their children inherit job membership from birth.
+There is no process-table walk: recorded parent IDs can refer to unrelated
+processes after PID reuse, and creation-time comparisons are not ancestry proof
+when the clock changes or timestamps are equal. Job assignment is best effort
+(a host may disable the module's job); the command still resumes when assignment
+fails. If resume fails, the tool ends and reaps its new process and returns the
+cause instead of leaving a suspended command.
 
 ## Configuration
 
