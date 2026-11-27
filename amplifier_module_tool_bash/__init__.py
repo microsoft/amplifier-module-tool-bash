@@ -592,44 +592,28 @@ def _assign_and_resume_windows_process(process: asyncio.subprocess.Process) -> N
 _WINDOWS_START_CLEANUP_TIMEOUT_SECONDS = 3.0
 
 
-async def _cleanup_failed_windows_start(
+async def _reap_failed_windows_start(
     process: asyncio.subprocess.Process,
 ) -> str | None:
-    """Kill our new root, close local pipes, and bound its reap independently.
+    """Only wait, independently bounded; root kill/pipe close already ran.
 
     A partly resumed command may already have started a child holding the pipes.
     Do NOT close/terminate the module-wide job: it can contain other commands.
     Such a child remains in that job (when enabled) and ends with the job.
+    That can be the whole lifetime of the tool's process.
     """
-    notes = []
-    try:
-        process.kill()
-    except ProcessLookupError:
-        pass  # already ended externally; still reap our handle
-    except Exception as error:
-        notes.append(f"Command cleanup could not kill the root: {error}")
-    finally:
-        # asyncio.Process has no public close API. Closing its transport closes
-        # our stdin/stdout/stderr ends, without waiting for descendant-held ends.
-        # In CPython 3.11/3.12 a pending wait() otherwise also waits for pipe EOF.
-        transport = getattr(process, "_transport", None)
-        if transport is not None:
-            try:
-                transport.close()
-            except Exception as error:
-                notes.append(f"Command cleanup could not close local pipes: {error}")
     try:
         await asyncio.wait_for(
             process.wait(), timeout=_WINDOWS_START_CLEANUP_TIMEOUT_SECONDS
         )
     except TimeoutError:
-        notes.append(
+        return (
             "Command cleanup did not finish within "
             f"{_WINDOWS_START_CLEANUP_TIMEOUT_SECONDS:g} seconds; stopped waiting"
         )
     except Exception as error:
-        notes.append(f"Command cleanup could not reap the root: {error}")
-    return "; ".join(notes) or None
+        return f"Command cleanup could not reap the root: {error}"
+    return None
 
 
 # --- Windows shell resolution: Git Bash discoverability + observability --
@@ -1721,18 +1705,54 @@ Constraints:
                 try:
                     _assign_and_resume_windows_process(process)
                 except BaseException as e:
-                    # Shield the independently bounded cleanup from subsequent
-                    # cancellation. The FIRST failure/interrupt is the outcome,
-                    # not a cancellation delivered while cleanup is running.
-                    cleanup = asyncio.create_task(
-                        _cleanup_failed_windows_start(process)
-                    )
-                    while not cleanup.done():
+                    # Do this synchronously BEFORE creating any task or yielding:
+                    # loop shutdown can directly cancel even a shielded task
+                    # before its first step. The job may be disabled by a host.
+                    cleanup_notes = []
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass  # already ended externally; still reap our handle
+                    except Exception as error:
+                        cleanup_notes.append(
+                            f"Command cleanup could not kill the root: {error}"
+                        )
+                    finally:
+                        # Process has no public close API. Close our transport
+                        # ends, not descendant-held ends. In CPython 3.11 to 3.13
+                        # a pending wait() otherwise also waits for pipe EOF.
+                        transport = getattr(process, "_transport", None)
+                        if transport is not None:
+                            try:
+                                transport.close()
+                            except Exception as error:
+                                cleanup_notes.append(
+                                    "Command cleanup could not close local pipes: "
+                                    f"{error}"
+                                )
+                    # Only reaping is asynchronous. Do not close the shared job;
+                    # it can hold other commands. Its children can remain until
+                    # that job closes, possibly the tool process's whole life.
+                    reap = asyncio.create_task(_reap_failed_windows_start(process))
+                    cancellation_received = None
+                    while not reap.done():
                         try:
-                            await asyncio.shield(cleanup)
-                        except asyncio.CancelledError:
+                            await asyncio.shield(reap)
+                        except asyncio.CancelledError as cancellation:
+                            # Direct cancellation of the reap (e.g. loop shutdown)
+                            # is not itself a caller Stop. Never read its result.
+                            if not reap.cancelled() and cancellation_received is None:
+                                cancellation_received = cancellation
                             continue
-                    cleanup_note = cleanup.result()
+                    if reap.cancelled():
+                        cleanup_notes.append(
+                            "Command cleanup did not finish: reap task was cancelled"
+                        )
+                    else:
+                        reap_note = reap.result()
+                        if reap_note:
+                            cleanup_notes.append(reap_note)
+                    cleanup_note = "; ".join(cleanup_notes)
                     if not isinstance(e, Exception):
                         if cleanup_note:
                             e.add_note(cleanup_note)
@@ -1740,6 +1760,11 @@ Constraints:
                     message = f"Windows command could not resume: {e}"
                     if cleanup_note:
                         message += f". {cleanup_note}"
+                    if cancellation_received is not None:
+                        # A person's Stop must stop the caller after bounded
+                        # cleanup, not become an ordinary failed command result.
+                        logger.warning("%s", message)
+                        raise cancellation_received
                     return {
                         "stdout": "",
                         "stderr": message,
