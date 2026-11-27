@@ -86,14 +86,17 @@ when the clock changes or timestamps are equal. Job assignment is best effort
 fails. Previous suspend counts zero and one are accepted; a higher count or a
 resume failure makes the tool kill its new root and close its own pipe ends
 synchronously before creating a task or yielding. Only reaping is asynchronous,
-with a three-second limit independent of the command timeout. A reap task
-cancelled directly at loop shutdown cannot skip the kill/close or replace the
-original cause; unfinished reaping is reported.
+with a three-second limit independent of the command timeout. Cancellation of
+only the reap task cannot skip the kill/close or replace the original cause;
+unfinished reaping is reported.
 
 An original interrupt is re-raised after bounded cleanup. If a Stop arrives
 during cleanup after an ordinary resume error, the cause is logged and that Stop
-is raised after cleanup, so the caller does not continue. Repeated cancellation
-does not interrupt the reap or restart its deadline. A child
+is raised after cleanup, so the caller does not continue, even when a loop
+shutdown cancels both the caller and the reap together. The caller's own
+cancellation count distinguishes that Stop from cancellation of only the reap.
+A caller's own time limit can end up to three seconds late because the bounded
+reap finishes first. Repeated cancellation does not restart its deadline. A child
 already started by a partly resumed root stays in the job, when enabled, and
 ends with that job; cleanup does not terminate the shared job or other commands.
 That can be the whole lifetime of the tool's process.

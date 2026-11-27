@@ -1734,14 +1734,23 @@ Constraints:
                     # it can hold other commands. Its children can remain until
                     # that job closes, possibly the tool process's whole life.
                     reap = asyncio.create_task(_reap_failed_windows_start(process))
+                    caller = asyncio.current_task()
+                    cancellation_count = (
+                        caller.cancelling() if caller is not None else 0
+                    )
                     cancellation_received = None
                     while not reap.done():
                         try:
                             await asyncio.shield(reap)
                         except asyncio.CancelledError as cancellation:
-                            # Direct cancellation of the reap (e.g. loop shutdown)
-                            # is not itself a caller Stop. Never read its result.
-                            if not reap.cancelled() and cancellation_received is None:
+                            # Only the caller's own count distinguishes Stop from
+                            # reap-only cancellation. Both tasks can be cancelled
+                            # in the same turn (including event-loop shutdown).
+                            if (
+                                caller is not None
+                                and caller.cancelling() > cancellation_count
+                                and cancellation_received is None
+                            ):
                                 cancellation_received = cancellation
                             continue
                     if reap.cancelled():
