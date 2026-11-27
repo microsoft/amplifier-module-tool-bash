@@ -191,8 +191,8 @@ def _signal_pids(pids: set[int], sig: int) -> None:
 # spawned here has no way to notice its parent is gone and no code of ours
 # runs to clean it up.
 #
-# A kill-on-close job is a Windows process group whose members Windows ends
-# when its last owning handle closes.
+# A Windows Job Object is a set of processes that Windows manages as one unit.
+# Kill-on-close makes Windows end its members when its last handle closes.
 # GAP-013/GAP-028: assigning a running command is too late to cover children
 # already born outside the job. A process-table walk is unsafe: recorded parent
 # IDs survive exit and can refer to foreign processes after ID reuse; creation
@@ -551,6 +551,9 @@ def _resume_windows_process(pid: int) -> None:
                         if previous_count == 0xFFFFFFFF:
                             raise failed("ResumeThread for suspended command failed")
                         if previous_count > 1:
+                            # Deliberate: if another program adds a suspension
+                            # to every new command, every command fails here.
+                            # We must not remove suspensions owned by that actor.
                             raise RuntimeError(
                                 f"The command's thread was suspended {previous_count} "
                                 "times; it is still suspended after one resume"
@@ -584,6 +587,49 @@ def _assign_and_resume_windows_process(process: asyncio.subprocess.Process) -> N
     except Exception as e:
         logger.debug("tool-bash: job assignment failed before resume (%s)", e)
     _resume_windows_process(process.pid)
+
+
+_WINDOWS_START_CLEANUP_TIMEOUT_SECONDS = 3.0
+
+
+async def _cleanup_failed_windows_start(
+    process: asyncio.subprocess.Process,
+) -> str | None:
+    """Kill our new root, close local pipes, and bound its reap independently.
+
+    A partly resumed command may already have started a child holding the pipes.
+    Do NOT close/terminate the module-wide job: it can contain other commands.
+    Such a child remains in that job (when enabled) and ends with the job.
+    """
+    notes = []
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass  # already ended externally; still reap our handle
+    except Exception as error:
+        notes.append(f"Command cleanup could not kill the root: {error}")
+    finally:
+        # asyncio.Process has no public close API. Closing its transport closes
+        # our stdin/stdout/stderr ends, without waiting for descendant-held ends.
+        # In CPython 3.11/3.12 a pending wait() otherwise also waits for pipe EOF.
+        transport = getattr(process, "_transport", None)
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception as error:
+                notes.append(f"Command cleanup could not close local pipes: {error}")
+    try:
+        await asyncio.wait_for(
+            process.wait(), timeout=_WINDOWS_START_CLEANUP_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        notes.append(
+            "Command cleanup did not finish within "
+            f"{_WINDOWS_START_CLEANUP_TIMEOUT_SECONDS:g} seconds; stopped waiting"
+        )
+    except Exception as error:
+        notes.append(f"Command cleanup could not reap the root: {error}")
+    return "; ".join(notes) or None
 
 
 # --- Windows shell resolution: Git Bash discoverability + observability --
@@ -1675,16 +1721,25 @@ Constraints:
                 try:
                     _assign_and_resume_windows_process(process)
                 except BaseException as e:
-                    # Never strand a suspended command on failure. Kill only
-                    # the process we just created. Even interrupts must reap it.
-                    try:
-                        process.kill()
-                    except ProcessLookupError:
-                        pass  # already ended externally; still reap our handle
-                    await process.wait()
+                    # Shield the independently bounded cleanup from subsequent
+                    # cancellation. The FIRST failure/interrupt is the outcome,
+                    # not a cancellation delivered while cleanup is running.
+                    cleanup = asyncio.create_task(
+                        _cleanup_failed_windows_start(process)
+                    )
+                    while not cleanup.done():
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            continue
+                    cleanup_note = cleanup.result()
                     if not isinstance(e, Exception):
+                        if cleanup_note:
+                            e.add_note(cleanup_note)
                         raise
                     message = f"Windows command could not resume: {e}"
+                    if cleanup_note:
+                        message += f". {cleanup_note}"
                     return {
                         "stdout": "",
                         "stderr": message,
