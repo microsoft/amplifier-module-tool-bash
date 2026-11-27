@@ -276,8 +276,12 @@ def test_helper_and_post_spawn_path_have_no_await():
     assert not any(
         isinstance(node, (ast.Await, ast.AsyncFunctionDef)) for node in ast.walk(helper)
     )
-    # Also guard the gap at the call site, not merely the synchronous helper.
-    run = ast.parse(textwrap.dedent(inspect.getsource(mod.BashTool._run_command)))
+    # Also guard the call's arguments, not merely the gap before its start.
+    _assert_no_await_before_resume(inspect.getsource(mod.BashTool._run_command))
+
+
+def _assert_no_await_before_resume(source):
+    run = ast.parse(textwrap.dedent(source))
     create = next(
         node
         for node in ast.walk(run)
@@ -295,12 +299,30 @@ def test_helper_and_post_spawn_path_have_no_await():
     )
     assert create.lineno < resume.lineno
     after_create = (create.end_lineno, create.end_col_offset)
-    before_resume = (resume.lineno, resume.col_offset)
+    through_resume = (resume.end_lineno, resume.end_col_offset)
     assert not any(
         isinstance(node, ast.Await)
-        and after_create < (node.lineno, node.col_offset) < before_resume
+        and after_create < (node.lineno, node.col_offset) < through_resume
         for node in ast.walk(run)
     )
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        "await asyncio.sleep(0); _assign_and_resume_windows_process(process)",
+        "_assign_and_resume_windows_process(await something(process))",
+    ],
+    ids=["same-line-await", "await-in-helper-argument"],
+)
+def test_no_await_guard_rejects_yields_through_end_of_call(call):
+    source = (
+        "async def run():\n"
+        "    process = await asyncio.create_subprocess_exec('command')\n"
+        f"    {call}\n"
+    )
+    with pytest.raises(AssertionError):
+        _assert_no_await_before_resume(source)
 
 
 def test_no_windows_process_table_walk_or_time_ancestry():
