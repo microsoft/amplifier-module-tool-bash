@@ -325,6 +325,60 @@ def test_no_await_guard_rejects_yields_through_end_of_call(call):
         _assert_no_await_before_resume(source)
 
 
+def _assert_failed_start_kill_and_close_before_tasks_or_await(source):
+    run = ast.parse(textwrap.dedent(source))
+    handler = next(
+        node
+        for node in ast.walk(run)
+        if isinstance(node, ast.ExceptHandler)
+        and isinstance(node.type, ast.Name)
+        and node.type.id == "BaseException"
+    )
+    kill = next(
+        node
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "kill"
+    )
+    close = next(
+        node
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "close"
+    )
+    after_close = (close.end_lineno, close.end_col_offset)
+    assert (kill.lineno, kill.col_offset) < after_close
+    for node in ast.walk(handler):
+        if isinstance(node, ast.Await) or (
+            isinstance(node, ast.Call)
+            and getattr(node.func, "attr", "") in ("create_task", "ensure_future")
+        ):
+            assert (node.lineno, node.col_offset) > after_close
+    reap = ast.parse(textwrap.dedent(inspect.getsource(mod._reap_failed_windows_start)))
+    assert not any(
+        isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") in ("kill", "close")
+        for node in ast.walk(reap)
+    ), "root kill/pipe close may not be delegated to the reap coroutine"
+
+
+def test_failed_start_kill_and_close_are_synchronous_before_task_creation():
+    _assert_failed_start_kill_and_close_before_tasks_or_await(
+        inspect.getsource(mod.BashTool._run_command)
+    )
+
+
+@pytest.mark.parametrize(
+    "before_kill",
+    ["await asyncio.sleep(0)", "asyncio.create_task(something())"],
+    ids=["await-before-kill", "task-before-kill"],
+)
+def test_failed_start_order_guard_rejects_async_work_before_kill(before_kill):
+    source = inspect.getsource(mod.BashTool._run_command)
+    assert source.count("process.kill()") == 1
+    source = source.replace("process.kill()", f"{before_kill}; process.kill()")
+    with pytest.raises(AssertionError):
+        _assert_failed_start_kill_and_close_before_tasks_or_await(source)
+
+
 def test_no_windows_process_table_walk_or_time_ancestry():
     for name in (
         "_protect_windows_descendants",

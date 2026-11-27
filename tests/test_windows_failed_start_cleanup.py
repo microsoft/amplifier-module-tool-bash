@@ -1,7 +1,7 @@
 """Failed Windows start must not wait for pipes held by an owned descendant.
 
-Fake Windows start/resume boundaries permit this regression on every platform,
-including CPython 3.11/3.12 CI. Real-process cases use only finite Python trees
+Fake Windows start/resume boundaries permit this regression on every platform.
+CPython 3.11 to 3.13 can wait for inherited pipes too. Real-process cases use finite Python trees
 started here, with cooperative descendant shutdown and retained root handles.
 """
 
@@ -24,6 +24,7 @@ class _Process:
         self.returncode = None
         self.waiting = asyncio.Event()
         self.release = asyncio.Event()
+        self.wait_finished = False
         self._transport = MagicMock()
         if depends_on_close:
             self._transport.close.side_effect = self.release.set
@@ -36,6 +37,7 @@ class _Process:
         assert self.killed, "must kill before waiting"
         self.waiting.set()
         await self.release.wait()
+        self.wait_finished = True
         return self.returncode
 
 
@@ -110,8 +112,11 @@ async def test_cleanup_deadline_preserves_first_outcome_and_closes_transport(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["failure", "cancellation", "interrupt", "exit"])
 async def test_repeated_cancellation_during_cleanup_keeps_first_outcome(
-    monkeypatch, kind
+    monkeypatch, caplog, kind
 ):
+    # Round 5 intentionally changes the ordinary-failure expectation: a Stop
+    # during cleanup must stop the caller after reaping, not become a result.
+    # An original interrupt still takes precedence over later cancellations.
     process = _Process()
     first = _first(kind)
     tool = _setup(monkeypatch, process, first)
@@ -126,19 +131,141 @@ async def test_repeated_cancellation_during_cleanup_keeps_first_outcome(
         assert process.killed
         process._transport.close.assert_called_once_with()
         assert not task.done(), "a later cancellation replaced the first outcome"
+        assert not process.wait_finished
         process.release.set()
         done, _ = await asyncio.wait({task}, timeout=2)
         assert task in done
         status, value = task.result()
+        assert process.wait_finished, "cancellation was raised before reaping finished"
+        assert status == "raised"
         if kind == "failure":
-            assert status == "result"
-            assert value["stderr"] == f"Windows command could not resume: {first}"
+            assert isinstance(value, asyncio.CancelledError)
+            assert value.args == ("second cancellation",)
+            assert str(first) in caplog.text
         else:
-            assert status == "raised"
             assert value is first
     finally:
         process.release.set()
         await asyncio.wait_for(task, 5)
+
+
+@pytest.mark.asyncio
+async def test_stop_during_cleanup_cancels_execute_and_prevents_caller_next_step(
+    monkeypatch, caplog
+):
+    process = _Process()
+    first = RuntimeError("original resume error before Stop")
+    tool = _setup(monkeypatch, process, first)
+    monkeypatch.setattr(mod, "_WINDOWS_START_CLEANUP_TIMEOUT_SECONDS", 0.5)
+    next_steps = []
+
+    async def caller():
+        await tool.execute({"command": "echo hi"})
+        next_steps.append("must not run")
+
+    task = asyncio.create_task(caller())
+    try:
+        await asyncio.wait_for(process.waiting.wait(), 2)
+        task.cancel("person's Stop")
+        await asyncio.sleep(0)
+        assert not task.done()
+        process.release.set()
+        with pytest.raises(asyncio.CancelledError, match="person's Stop"):
+            await asyncio.wait_for(task, 2)
+        assert task.cancelled()
+        assert process.wait_finished
+        assert next_steps == []
+        assert str(first) in caplog.text
+    finally:
+        process.release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_execute_remains_a_timeout_after_bounded_reap(
+    monkeypatch, caplog
+):
+    process = _Process()
+    first = RuntimeError("original resume error before caller timeout")
+    tool = _setup(monkeypatch, process, first)
+    monkeypatch.setattr(mod, "_WINDOWS_START_CLEANUP_TIMEOUT_SECONDS", 0.05)
+    start = time.monotonic()
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(tool.execute({"command": "echo hi"}), 0.01)
+    assert time.monotonic() - start < 2
+    assert process.killed
+    process._transport.close.assert_called_once_with()
+    assert str(first) in caplog.text
+    assert "cleanup did not finish within 0.05 seconds" in caplog.text
+
+
+@pytest.mark.parametrize("kind", ["failure", "cancellation", "interrupt", "exit"])
+def test_asyncio_run_shutdown_before_reap_first_step_already_killed_and_closed(
+    monkeypatch, kind
+):
+    saved = {}
+
+    async def main():
+        process = _Process()
+        first = _first(kind)
+        tool = _setup(monkeypatch, process, first)
+        saved.update(process=process, first=first)
+        saved["worker"] = asyncio.create_task(_catch_first(tool))
+        # Return without awaiting the worker. run_until_complete queues its stop
+        # callback after the worker's first step, but before the new reap's first
+        # step. asyncio.run then directly cancels ALL pending tasks at shutdown.
+
+    asyncio.run(main())
+    process, first = saved["process"], saved["first"]
+    assert process.killed, "root kill must not depend on the reap task's first step"
+    process._transport.close.assert_called_once_with()
+    assert not process.waiting.is_set(), "the reap must not have started in this probe"
+    status, value = saved["worker"].result()
+    if kind == "failure":
+        assert status == "result"
+        assert str(first) in value["stderr"]
+        assert "reap task was cancelled" in value["stderr"]
+        assert value["stderr_raw"] == value["stderr"].encode("utf-8")
+    else:
+        assert status == "raised"
+        assert value is first
+        assert any("reap task was cancelled" in note for note in first.__notes__)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["failure", "cancellation", "interrupt", "exit"])
+async def test_direct_reap_cancellation_does_not_replace_original_outcome(
+    monkeypatch, kind
+):
+    process = _Process()
+    first = _first(kind)
+    tool = _setup(monkeypatch, process, first)
+    create_task = asyncio.create_task
+    reaps = []
+
+    def cancel_before_start(coro, *args, **kwargs):
+        if coro.cr_code.co_name == "_reap_failed_windows_start":
+            assert process.killed, "kill must precede reap task creation"
+            process._transport.close.assert_called_once_with()
+            task = create_task(coro, *args, **kwargs)
+            reaps.append(task)
+            task.cancel("direct reap cancellation")
+            return task
+        return create_task(coro, *args, **kwargs)
+
+    monkeypatch.setattr(mod.asyncio, "create_task", cancel_before_start)
+    status, value = await _catch_first(tool)
+    assert len(reaps) == 1
+    assert reaps[0].cancelled()
+    assert not process.waiting.is_set()
+    if kind == "failure":
+        assert status == "result"
+        assert str(first) in value["stderr"]
+        assert "reap task was cancelled" in value["stderr"]
+    else:
+        assert status == "raised"
+        assert value is first
+        assert any("reap task was cancelled" in note for note in first.__notes__)
 
 
 @pytest.mark.asyncio
