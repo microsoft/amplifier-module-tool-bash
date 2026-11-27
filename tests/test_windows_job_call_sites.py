@@ -115,8 +115,145 @@ async def test_failed_resume_kills_reaps_and_returns_error_without_hang(
     assert result == {
         "stdout": "",
         "stderr": f"Windows command could not resume: {cause}",
+        "stdout_raw": b"",
+        "stderr_raw": f"Windows command could not resume: {cause}".encode("utf-8"),
         "returncode": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_execute_failed_resume_preserves_person_visible_cause(monkeypatch):
+    events = []
+    proc = _FakeProc(events)
+    tool = mod.BashTool({"safety_profile": "unrestricted"})
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(
+        tool, "_resolve_windows_bash", AsyncMock(return_value=("bash.exe", False))
+    )
+    monkeypatch.setattr(
+        mod.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)
+    )
+    monkeypatch.setattr(mod, "_assign_to_windows_job", lambda _: False)
+    cause = "ResumeThread failed (Windows error code 5)"
+    monkeypatch.setattr(
+        mod, "_resume_windows_process", MagicMock(side_effect=RuntimeError(cause))
+    )
+    result = await asyncio.wait_for(tool.execute({"command": "echo hi"}), 5)
+    assert result.success is False
+    assert isinstance(result.output, dict), result.output
+    assert cause in result.output["stderr"]
+    assert result.output["returncode"] == 1
+    assert events == ["kill", "reap"]
+
+
+@pytest.mark.asyncio
+async def test_execute_no_bash_preserves_person_visible_cause(monkeypatch):
+    tool = mod.BashTool({"safety_profile": "unrestricted"})
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(
+        tool, "_resolve_windows_bash", AsyncMock(return_value=(None, False))
+    )
+    result = await tool.execute({"command": "echo hi"})
+    assert result.success is False
+    assert isinstance(result.output, dict), result.output
+    assert result.output["stderr"] == mod._WINDOWS_NO_BASH_ERROR
+    assert result.output["returncode"] == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_decoded_only_result_uses_utf8_fallback(monkeypatch):
+    tool = mod.BashTool({"safety_profile": "unrestricted"})
+    monkeypatch.setattr(
+        tool,
+        "_run_command",
+        AsyncMock(
+            return_value={
+                "stdout": "caf\u00e9",
+                "stderr": "cause \u00e9",
+                "returncode": 1,
+            }
+        ),
+    )
+    result = await tool.execute({"command": "echo hi"})
+    assert result.success is False
+    assert result.output == {
+        "stdout": "caf\u00e9",
+        "stderr": "cause \u00e9",
+        "returncode": 1,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "interrupt_type", [KeyboardInterrupt, SystemExit, asyncio.CancelledError]
+)
+@pytest.mark.parametrize("failure_site", ["assign", "resume"])
+async def test_interrupt_kills_reaps_then_reraises(
+    monkeypatch, interrupt_type, failure_site
+):
+    events = []
+    proc = _FakeProc(events)
+    tool = mod.BashTool({})
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(
+        tool, "_resolve_windows_bash", AsyncMock(return_value=("bash.exe", False))
+    )
+    monkeypatch.setattr(
+        mod.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)
+    )
+    interrupt = interrupt_type("stop")
+    monkeypatch.setattr(
+        mod,
+        "_assign_to_windows_job",
+        MagicMock(side_effect=interrupt)
+        if failure_site == "assign"
+        else lambda _: False,
+    )
+    resume = (
+        MagicMock(side_effect=interrupt) if failure_site == "resume" else MagicMock()
+    )
+    monkeypatch.setattr(mod, "_resume_windows_process", resume)
+    # Catch in this same coroutine; an unhandled KeyboardInterrupt in a separate
+    # asyncio task would stop pytest's loop instead of testing the contract.
+    with pytest.raises(interrupt_type) as raised:
+        await tool._run_command("echo hi", timeout=30)
+    assert raised.value is interrupt
+    assert events == ["kill", "reap"]
+    if failure_site == "assign":
+        resume.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_failed_resume_already_exited_process_is_still_reaped(monkeypatch):
+    events = []
+    proc = _FakeProc(events)
+    proc.killed = True
+    proc.returncode = 1
+
+    def gone():
+        events.append("kill")
+        raise ProcessLookupError("already ended")
+
+    proc.kill = gone
+    tool = mod.BashTool({})
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(
+        tool, "_resolve_windows_bash", AsyncMock(return_value=("bash.exe", False))
+    )
+    monkeypatch.setattr(
+        mod.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)
+    )
+    monkeypatch.setattr(mod, "_assign_to_windows_job", lambda _: False)
+    monkeypatch.setattr(
+        mod,
+        "_resume_windows_process",
+        MagicMock(side_effect=RuntimeError("resume failed")),
+    )
+    result = await asyncio.wait_for(tool._run_command("echo hi", timeout=30), 5)
+    assert events == ["kill", "reap"]
+    assert result["stderr"] == "Windows command could not resume: resume failed"
+    assert result["stderr_raw"] == result["stderr"].encode("utf-8")
+    assert result["returncode"] == 1
 
 
 def test_get_job_entry_point_is_looked_up_at_call_time(monkeypatch):
@@ -157,8 +294,11 @@ def test_helper_and_post_spawn_path_have_no_await():
         and node.func.id == "_assign_and_resume_windows_process"
     )
     assert create.lineno < resume.lineno
+    after_create = (create.end_lineno, create.end_col_offset)
+    before_resume = (resume.lineno, resume.col_offset)
     assert not any(
-        isinstance(node, ast.Await) and create.end_lineno < node.lineno < resume.lineno
+        isinstance(node, ast.Await)
+        and after_create < (node.lineno, node.col_offset) < before_resume
         for node in ast.walk(run)
     )
 
