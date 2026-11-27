@@ -201,7 +201,7 @@ async def test_wait_for_execute_remains_a_timeout_after_bounded_reap(
 
 @pytest.mark.parametrize("kind", ["failure", "cancellation", "interrupt", "exit"])
 def test_asyncio_run_shutdown_before_reap_first_step_already_killed_and_closed(
-    monkeypatch, kind
+    monkeypatch, caplog, kind
 ):
     saved = {}
 
@@ -222,10 +222,12 @@ def test_asyncio_run_shutdown_before_reap_first_step_already_killed_and_closed(
     assert not process.waiting.is_set(), "the reap must not have started in this probe"
     status, value = saved["worker"].result()
     if kind == "failure":
-        assert status == "result"
-        assert str(first) in value["stderr"]
-        assert "reap task was cancelled" in value["stderr"]
-        assert value["stderr_raw"] == value["stderr"].encode("utf-8")
+        # Round 6: asyncio.run cancelled the caller too. Returning an error
+        # result here asserted the bug; its own Stop must survive the overlap.
+        assert status == "raised"
+        assert isinstance(value, asyncio.CancelledError)
+        assert str(first) in caplog.text
+        assert "reap task was cancelled" in caplog.text
     else:
         assert status == "raised"
         assert value is first
@@ -266,6 +268,157 @@ async def test_direct_reap_cancellation_does_not_replace_original_outcome(
         assert status == "raised"
         assert value is first
         assert any("reap task was cancelled" in note for note in first.__notes__)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("order", ["reap-first", "caller-first"])
+@pytest.mark.parametrize("timing", ["before-reap-start", "reap-waiting"])
+async def test_simultaneous_caller_and_reap_cancellation_stops_execute_caller(
+    monkeypatch, caplog, order, timing
+):
+    process = _Process()
+    first = RuntimeError(f"original resume cause: {timing}, {order}")
+    tool = _setup(monkeypatch, process, first)
+    create_task = asyncio.create_task
+    reaps = []
+    next_steps = []
+    loop = asyncio.get_running_loop()
+
+    def cancel_both():
+        assert process.waiting.is_set() == (timing == "reap-waiting")
+        # No yield between the two requests: both precede the shield waking.
+        if order == "reap-first":
+            reaps[0].cancel("direct reap cancellation")
+            task.cancel("person's simultaneous Stop")
+        else:
+            task.cancel("person's simultaneous Stop")
+            reaps[0].cancel("direct reap cancellation")
+
+    def record_reap(coro, *args, **kwargs):
+        if coro.cr_code.co_name == "_reap_failed_windows_start":
+            if timing == "before-reap-start":
+                # Queue the cancellation callback ahead of the reap's first
+                # step, but AFTER the caller records its pre-wait count.
+                loop.call_soon(cancel_both)
+            reap = create_task(coro, *args, **kwargs)
+            reaps.append(reap)
+            return reap
+        return create_task(coro, *args, **kwargs)
+
+    async def caller():
+        await tool.execute({"command": "echo hi"})
+        next_steps.append("must not run")
+
+    monkeypatch.setattr(mod.asyncio, "create_task", record_reap)
+    task = create_task(caller())
+    try:
+        if timing == "reap-waiting":
+            await asyncio.wait_for(process.waiting.wait(), 2)
+            cancel_both()
+        done, _ = await asyncio.wait({task}, timeout=2)
+        assert task in done, "overlapping cancellations must not hang"
+        assert task.cancelled(), "a real caller Stop must not become a result"
+        with pytest.raises(asyncio.CancelledError, match="person's simultaneous Stop"):
+            task.result()
+        assert task.cancelling() == 1  # no uncancel(): preserve caller state
+        assert len(reaps) == 1 and reaps[0].cancelled()
+        assert process.killed
+        process._transport.close.assert_called_once_with()
+        assert next_steps == []
+        assert str(first) in caplog.text
+        assert "reap task was cancelled" in caplog.text
+    finally:
+        process.release.set()
+        await asyncio.gather(task, *reaps, return_exceptions=True)
+
+
+@pytest.mark.parametrize("timing", ["before-reap-start", "reap-waiting"])
+def test_asyncio_run_shutdown_stops_execute_caller_in_both_reap_timings(
+    monkeypatch, caplog, timing
+):
+    # Exercise real asyncio.run cancellation of EVERY pending task repeatedly,
+    # not just a hand-picked callback order. Both timings have their own proof.
+    for attempt in range(30):
+        saved = {}
+        next_steps = []
+
+        async def main():
+            process = _Process()
+            first = RuntimeError(f"teardown resume cause: {timing}, attempt {attempt}")
+            tool = _setup(iteration, process, first)
+            saved.update(process=process, first=first)
+
+            async def caller():
+                await tool.execute({"command": "echo hi"})
+                next_steps.append("must not run")
+
+            saved["caller"] = asyncio.create_task(caller())
+            if timing == "reap-waiting":
+                await asyncio.wait_for(process.waiting.wait(), 2)
+            # Returning starts real teardown. In before-reap-start the caller's
+            # first step precedes the stop callback but the reap's does not.
+
+        # Restore the faked platform between runs before constructing another
+        # tool; otherwise POSIX shell discovery would see a Windows platform.
+        with monkeypatch.context() as iteration:
+            asyncio.run(main())
+        process, task = saved["process"], saved["caller"]
+        assert process.waiting.is_set() == (timing == "reap-waiting"), attempt
+        assert process.killed
+        process._transport.close.assert_called_once_with()
+        assert task.cancelled(), (timing, attempt, next_steps)
+        assert task.cancelling() > 0
+        assert next_steps == []
+        assert str(saved["first"]) in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_cancellation", [False, True])
+async def test_reap_only_cancellation_uses_caller_count_delta(
+    monkeypatch, prior_cancellation
+):
+    process = _Process()
+    first = RuntimeError("reap-only resume cause")
+    tool = _setup(monkeypatch, process, first)
+    create_task = asyncio.create_task
+    reaps = []
+
+    def record_reap(coro, *args, **kwargs):
+        task = create_task(coro, *args, **kwargs)
+        if coro.cr_code.co_name == "_reap_failed_windows_start":
+            reaps.append(task)
+        return task
+
+    async def caller():
+        if prior_cancellation:
+            # Leave an earlier handled cancellation request counted. A reap-only
+            # cancellation must not be misclassified from an absolute count >0.
+            asyncio.current_task().cancel("previously handled Stop")
+            try:
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                pass
+        return await tool.execute({"command": "echo hi"})
+
+    monkeypatch.setattr(mod.asyncio, "create_task", record_reap)
+    task = create_task(caller())
+    try:
+        await asyncio.wait_for(process.waiting.wait(), 2)
+        count_before = task.cancelling()
+        reaps[0].cancel("reap only; no new caller Stop")
+        done, _ = await asyncio.wait({task}, timeout=2)
+        assert task in done
+        assert not task.cancelled()
+        assert task.cancelling() == count_before == int(prior_cancellation)
+        result = task.result()
+        assert result.success is False
+        assert str(first) in result.output["stderr"]
+        assert "reap task was cancelled" in result.output["stderr"]
+        assert process.killed
+        process._transport.close.assert_called_once_with()
+    finally:
+        process.release.set()
+        await asyncio.gather(task, *reaps, return_exceptions=True)
 
 
 @pytest.mark.asyncio
