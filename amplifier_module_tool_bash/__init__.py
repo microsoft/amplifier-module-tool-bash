@@ -191,6 +191,8 @@ def _signal_pids(pids: set[int], sig: int) -> None:
 # spawned here has no way to notice its parent is gone and no code of ours
 # runs to clean it up.
 #
+# A kill-on-close job is a Windows process group whose members Windows ends
+# when its last owning handle closes.
 # GAP-013/GAP-028: assigning a running command is too late to cover children
 # already born outside the job. A process-table walk is unsafe: recorded parent
 # IDs survive exit and can refer to foreign processes after ID reuse; creation
@@ -200,9 +202,12 @@ def _signal_pids(pids: set[int], sig: int) -> None:
 # when assigned 0.3s after start, with four Windows-side children outside it.
 # Creating the root suspended, assigning it, then resuming put all five in the
 # job and all ended on job close (mechanism evidence from one PC, not this code).
+# CI has no WSL; that result was measured by hand, not with this implementation.
 #
 # Fix: create foreground commands SUSPENDED, assign to the process-wide job,
-# then resume, so Windows propagates job membership from birth. No process-table
+# then resume each verified thread once, so Windows propagates job membership
+# from birth. A previous suspend count above one fails rather than leaving the
+# command suspended; kill/reap it and report the cause. No process-table
 # walk, and no change to background/managed paths. A host already owning a job
 # may replace _get_windows_job_object and _assign_to_windows_job to disable this
 # extra job; both remain module-global entry points looked up at call time.
@@ -452,12 +457,14 @@ def _assign_to_windows_job(pid: int) -> bool:
         return False
 
 
-def _resume_windows_process(pid: int) -> None:
-    """Resume the new suspended command's primary thread, or raise a cause.
+_windows_thread_entry_type = None
 
-    Only a THREAD snapshot is used. The caller must still own the newly spawned
-    process, with no intervening await, so the owner PID cannot have been reused.
-    """
+
+def _get_windows_thread_entry_type():
+    """Cache the ctypes type, without loading any Windows DLL at import time."""
+    global _windows_thread_entry_type
+    if _windows_thread_entry_type is not None:
+        return _windows_thread_entry_type
     import ctypes
     from ctypes import wintypes
 
@@ -471,6 +478,26 @@ def _resume_windows_process(pid: int) -> None:
             ("tpDeltaPri", wintypes.LONG),
             ("dwFlags", wintypes.DWORD),
         ]
+
+    _windows_thread_entry_type = THREADENTRY32
+    return THREADENTRY32
+
+
+def _resume_windows_process(pid: int) -> None:
+    """Resume each verified command thread once; fail if any remains suspended.
+
+    Only a THREAD snapshot is used. The caller must still own the newly spawned
+    process, with no intervening await, so the owner PID cannot have been reused.
+    Thread IDs can be reused, so verify the opened handle's owner too. Counts
+    zero and one are accepted; higher counts fail without repeatedly resuming.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    THREADENTRY32 = _get_windows_thread_entry_type()
+
+    def failed(cause: str) -> RuntimeError:
+        return RuntimeError(f"{cause} (Windows error code {ctypes.get_last_error()})")
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
@@ -487,6 +514,8 @@ def _resume_windows_process(pid: int) -> None:
     ]
     kernel32.OpenThread.restype = wintypes.HANDLE
     kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.GetProcessIdOfThread.restype = wintypes.DWORD
+    kernel32.GetProcessIdOfThread.argtypes = [wintypes.HANDLE]
     kernel32.ResumeThread.restype = wintypes.DWORD
     kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
@@ -494,31 +523,49 @@ def _resume_windows_process(pid: int) -> None:
 
     TH32CS_SNAPTHREAD = 0x00000004
     THREAD_SUSPEND_RESUME = 0x0002
+    THREAD_QUERY_LIMITED_INFORMATION = 0x0800
     snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
     if not snapshot or snapshot == ctypes.c_void_p(-1).value:
-        raise RuntimeError("CreateToolhelp32Snapshot for command threads failed")
+        raise failed("CreateToolhelp32Snapshot for command threads failed")
     try:
         entry = THREADENTRY32()
         entry.dwSize = ctypes.sizeof(entry)
         if not kernel32.Thread32First(snapshot, ctypes.byref(entry)):
-            raise RuntimeError("Thread32First found no command thread")
+            raise failed("Thread32First found no command thread")
+        resumed = False
         while True:
             if entry.th32OwnerProcessID == pid:
                 thread = kernel32.OpenThread(
-                    THREAD_SUSPEND_RESUME, False, entry.th32ThreadID
+                    THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+                    False,
+                    entry.th32ThreadID,
                 )
                 if not thread:
-                    raise RuntimeError("OpenThread for suspended command failed")
+                    raise failed("OpenThread for suspended command failed")
                 try:
-                    if kernel32.ResumeThread(thread) == 0xFFFFFFFF:
-                        raise RuntimeError("ResumeThread for suspended command failed")
-                    # CREATE_SUSPENDED starts with one primary thread; it has
-                    # not run user code and cannot yet have spawned more.
-                    return
+                    owner = kernel32.GetProcessIdOfThread(thread)
+                    if not owner:
+                        raise failed("GetProcessIdOfThread for command thread failed")
+                    if owner == pid:
+                        previous_count = kernel32.ResumeThread(thread)
+                        if previous_count == 0xFFFFFFFF:
+                            raise failed("ResumeThread for suspended command failed")
+                        if previous_count > 1:
+                            raise RuntimeError(
+                                f"The command's thread was suspended {previous_count} "
+                                "times; it is still suspended after one resume"
+                            )
+                        resumed = True
+                    # A mismatched handle belongs to a reused thread ID. Close
+                    # and skip it, never resume a thread of a foreign process.
                 finally:
                     kernel32.CloseHandle(thread)
             if not kernel32.Thread32Next(snapshot, ctypes.byref(entry)):
-                raise RuntimeError(f"No thread found for suspended command PID {pid}")
+                if ctypes.get_last_error() != 18:  # ERROR_NO_MORE_FILES
+                    raise failed("Thread32Next for command threads failed")
+                break
+        if not resumed:
+            raise RuntimeError(f"No thread found for suspended command PID {pid}")
     finally:
         kernel32.CloseHandle(snapshot)
 
@@ -1178,23 +1225,32 @@ Constraints:
                 # Execute command and wait for completion
                 result = await self._run_command(command, timeout=timeout)
 
+                # Synthetic/older error paths may provide only decoded text.
+                # Preserve their cause rather than replacing it with KeyError.
+                stdout_raw = result.get("stdout_raw")
+                if stdout_raw is None:
+                    stdout_raw = result["stdout"].encode("utf-8", errors="replace")
+                stderr_raw = result.get("stderr_raw")
+                if stderr_raw is None:
+                    stderr_raw = result["stderr"].encode("utf-8", errors="replace")
+
                 # Decode, withholding binary BEFORE truncating. Truncation
                 # bounds a single call but not a session: a binary payload
                 # still costs tens of thousands of tokens of noise per call
                 # after truncation, so a few dozen such calls exhaust even a
                 # 1M-token context.
                 stdout, stdout_binary = self._guard_binary_output(
-                    result["stdout_raw"], stream="stdout"
+                    stdout_raw, stream="stdout"
                 )
                 stderr, stderr_binary = self._guard_binary_output(
-                    result["stderr_raw"], stream="stderr"
+                    stderr_raw, stream="stderr"
                 )
 
                 # True sizes as produced by the subprocess. Taken before
                 # truncation and independently of decoding, so a lossy decode
                 # (U+FFFD is 3 bytes for a 1-byte input) cannot inflate them.
-                stdout_bytes = len(result["stdout_raw"])
-                stderr_bytes = len(result["stderr_raw"])
+                stdout_bytes = len(stdout_raw)
+                stderr_bytes = len(stderr_raw)
 
                 # Apply output truncation to prevent context overflow
                 stdout, stdout_truncated, _ = self._truncate_output(stdout)
@@ -1618,17 +1674,22 @@ Constraints:
                 # holds the process handle, so this new PID cannot be reused.
                 try:
                     _assign_and_resume_windows_process(process)
-                except Exception as e:
+                except BaseException as e:
                     # Never strand a suspended command on failure. Kill only
-                    # the process we just created (it has not spawned children).
+                    # the process we just created. Even interrupts must reap it.
                     try:
                         process.kill()
                     except ProcessLookupError:
                         pass  # already ended externally; still reap our handle
                     await process.wait()
+                    if not isinstance(e, Exception):
+                        raise
+                    message = f"Windows command could not resume: {e}"
                     return {
                         "stdout": "",
-                        "stderr": f"Windows command could not resume: {e}",
+                        "stderr": message,
+                        "stdout_raw": b"",
+                        "stderr_raw": message.encode("utf-8"),
                         "returncode": 1,
                     }
             else:

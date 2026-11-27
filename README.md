@@ -74,14 +74,22 @@ Execute a bash command with platform-appropriate shell.
 
 ### Windows orphan protection
 
-Foreground Windows commands start suspended, are assigned to the kill-on-close
-job, then resume, so their children inherit job membership from birth.
+A kill-on-close job is a Windows process group whose members Windows ends when
+its last owning handle closes. Foreground Windows commands start suspended, are
+assigned to that job, then each verified command thread is resumed once, so
+children inherit job membership from birth.
 There is no process-table walk: recorded parent IDs can refer to unrelated
 processes after PID reuse, and creation-time comparisons are not ancestry proof
 when the clock changes or timestamps are equal. Job assignment is best effort
-(a host may disable the module's job); the command still resumes when assignment
-fails. If resume fails, the tool ends and reaps its new process and returns the
-cause instead of leaving a suspended command.
+(a host may disable the module's job); resume is still attempted when assignment
+fails. Previous suspend counts zero and one are accepted; a higher count or a
+resume failure makes the tool end and reap its new process and return the cause
+instead of leaving a suspended command.
+
+CI has no WSL. A manual mechanism test on one Windows 11 PC (not a run of this
+implementation) found only the root in the job after a 0.3-second late
+assignment, versus all five Windows-side WSL processes in the job and ending on
+job close when the root was created suspended, assigned, and then resumed.
 
 ## Configuration
 
