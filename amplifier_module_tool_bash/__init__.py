@@ -678,7 +678,10 @@ def _close_windows_command_job(process) -> None:
     job = getattr(process, "_tool_bash_command_job", None)
     if job is not None:
         process._tool_bash_command_job = None
-        job.close()
+        try:
+            job.close()
+        except Exception as error:
+            logger.warning("tool-bash: command job close failed (%s)", error)
 
 
 def _assign_and_resume_windows_process(process: asyncio.subprocess.Process) -> None:
@@ -696,28 +699,55 @@ def _assign_and_resume_windows_process(process: asyncio.subprocess.Process) -> N
         logger.debug("tool-bash: job assignment failed before resume (%s)", e)
     # Nest only after the optional module-wide job, but before any thread runs.
     # Both are module-global lookups: a host can disable either independently.
-    process._tool_bash_command_job = _create_windows_command_job(process.pid)
+    process._tool_bash_command_job = None
+    try:
+        process._tool_bash_command_job = _create_windows_command_job(process.pid)
+    except Exception as error:
+        # A host replacement has the same best-effort contract as our factory.
+        _report_windows_command_job_failure(error)
     try:
         _resume_windows_process(process.pid)
     except BaseException:
+        # A thread may have run and started children before a later step failed.
+        # End this command's tree before releasing its handle. The caller still
+        # kills the root, closes local pipes and performs the bounded reap.
+        job = process._tool_bash_command_job
+        if job is not None:
+            try:
+                job.terminate()
+            except Exception as error:
+                logger.warning(
+                    "tool-bash: failed-start tree termination failed (%s)", error
+                )
         _close_windows_command_job(process)
         raise
 
 
 def _terminate_windows_command(process) -> None:
     """End only this command's tree; close local pipes without waiting for EOF."""
-    job = getattr(process, "_tool_bash_command_job", None)
-    terminated = job.terminate() if job is not None else False
+    terminated = False
+    try:
+        job = getattr(process, "_tool_bash_command_job", None)
+        terminated = job.terminate() if job is not None else False
+    except Exception as error:
+        logger.warning("tool-bash: command tree termination failed (%s)", error)
     try:
         if not terminated:
             try:
                 process.kill()
             except ProcessLookupError:
                 pass
+            except Exception as error:
+                logger.warning("tool-bash: command root kill failed (%s)", error)
     finally:
-        transport = getattr(process, "_transport", None)
-        if transport is not None:
-            transport.close()
+        try:
+            transport = getattr(process, "_transport", None)
+            if transport is not None:
+                transport.close()
+        except ProcessLookupError:
+            pass
+        except Exception as error:
+            logger.warning("tool-bash: command pipe close failed (%s)", error)
 
 
 _WINDOWS_START_CLEANUP_TIMEOUT_SECONDS = 3.0
@@ -730,8 +760,9 @@ async def _reap_failed_windows_start(
 
     A partly resumed command may already have started a child holding the pipes.
     Do NOT close/terminate the module-wide job: it can contain other commands.
-    Such a child remains in that job (when enabled) and ends with the job.
-    That can be the whole lifetime of the tool's process.
+    The failed-start caller already attempted command-job tree termination
+    before closing that job's handle. Without it, root-only cleanup cannot
+    guarantee termination of a partly started child in the shared host job.
     """
     try:
         await asyncio.wait_for(
@@ -914,20 +945,14 @@ async def _cleanup_process_tree(
 ) -> None:
     """Best-effort termination of a subprocess and its descendants.
 
+    Used for POSIX foreground/managed cleanup. Windows foreground cleanup uses
+    synchronous command-job termination in _await_process_tree_cleanup instead.
     Mirrors the tool's timeout cleanup behavior:
       - kill the process group (Unix) when available
       - on Linux, also signal setsid()-detached descendants discovered via /proc
       - wait briefly, then SIGKILL
       - reap via communicate()
     """
-
-    if is_windows:
-        _terminate_windows_command(process)
-        if reap:
-            note = await _reap_failed_windows_start(process)
-            if note:
-                logger.warning("tool-bash: %s", note)
-        return
 
     if pgid is not None and not is_windows:
         # Walk /proc for descendants BEFORE killing anything.
@@ -957,7 +982,7 @@ async def _cleanup_process_tree(
             pass
         _signal_pids(descendant_pids, signal.SIGKILL)
     else:
-        # Windows or no pgid: kill just the main process
+        # No process group: kill just the main process.
         process.kill()
 
     # Managed sessions already have dedicated stream readers. Do not compete
