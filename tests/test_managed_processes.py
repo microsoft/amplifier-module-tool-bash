@@ -3,6 +3,7 @@
 import asyncio
 import shlex
 import sys
+import time
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -53,6 +54,33 @@ def text(result, stream="stdout"):
     )
 
 
+async def ready_line(tool, started, *, timeout=5, clock=time.monotonic):
+    """Collect a readiness line; fail even if terminal waits never yield."""
+    page = started
+    stdout, stderr = text(page), text(page, "stderr")
+    deadline = clock() + timeout
+    async with asyncio.timeout(timeout):
+        while "ready\n" not in stdout:
+            detail = f"state={page['state']}, stdout={stdout!r}, stderr={stderr!r}"
+            assert not page.get("output_complete") and page["state"] not in {
+                "completed",
+                "failed",
+                "cancelled",
+                "outcome_unknown",
+            }, f"Process ended before the complete readiness line: {detail}"
+            assert clock() < deadline, f"Readiness deadline expired: {detail}"
+            page = await action(
+                tool,
+                "wait",
+                process_id=started["process_id"],
+                cursor=page["next_cursor"],
+                wait_ms=1000,
+            )
+            stdout += text(page)
+            stderr += text(page, "stderr")
+    return page, stdout, stderr
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["run", "start"])
 async def test_documented_literal_executable_with_variable_data(tmp_path, mode):
@@ -91,10 +119,9 @@ async def test_incremental_output_stdin_eof_and_real_exit_code(tool):
         ),
     )
     process_id = started["process_id"]
-    first = await action(
-        tool, "wait", process_id=process_id, cursor=started["next_cursor"], wait_ms=5000
-    )
-    assert "ready" in text(started) + text(first)
+    # Output chunks are byte-stream pages, not lines. With python -u, print()
+    # can deliver the word and its newline in separate writes/pages.
+    first, ready_stdout, ready_stderr = await ready_line(tool, started)
     assert first["state"] == "running"
     await action(
         tool, "write", process_id=process_id, stdin="hello\n", close_stdin=True
@@ -106,8 +133,8 @@ async def test_incremental_output_stdin_eof_and_real_exit_code(tool):
     remaining = await action(
         tool, "read", process_id=process_id, cursor=first["next_cursor"]
     )
-    assert text(remaining) == "got:hello\n"
-    assert text(remaining, "stderr") == "err\n"
+    assert ready_stdout + text(remaining) == "ready\ngot:hello\n"
+    assert ready_stderr + text(remaining, "stderr") == "err\n"
     assert (
         await action(
             tool, "read", process_id=process_id, cursor=remaining["next_cursor"]
@@ -117,6 +144,40 @@ async def test_incremental_output_stdin_eof_and_real_exit_code(tool):
         await action(tool, "read", process_id=process_id, cursor=first["next_cursor"])
         == remaining
     )
+
+
+@pytest.mark.asyncio
+async def test_readiness_incomplete_line_at_exit_fails_fast(tool):
+    started = await action(
+        tool, "start", command=python("import sys; sys.stdout.write('ready')")
+    )
+    begin = time.monotonic()
+    with pytest.raises(
+        AssertionError, match="Process ended before.*readiness line"
+    ) as error:
+        await ready_line(tool, started)
+    assert time.monotonic() - begin < 2
+    assert "stdout='ready'" in str(error.value)
+    assert "state=" in str(error.value)
+
+
+@pytest.mark.asyncio
+async def test_readiness_deadline_checked_when_pages_do_not_yield(monkeypatch):
+    page = {
+        "state": "running",
+        "output_complete": False,
+        "process_id": "fake",
+        "next_cursor": 0,
+        "chunks": [],
+    }
+
+    async def immediate(*args, **kwargs):
+        return page
+
+    monkeypatch.setitem(globals(), "action", immediate)
+    ticks = iter([0, 1, 2, 6])
+    with pytest.raises(AssertionError, match="Readiness deadline expired.*running"):
+        await ready_line(None, page, clock=lambda: next(ticks))
 
 
 @pytest.mark.asyncio
