@@ -96,15 +96,39 @@ is raised after cleanup, so the caller does not continue, even when a loop
 shutdown cancels both the caller and the reap together. The caller's own
 cancellation count distinguishes that Stop from cancellation of only the reap.
 A caller's own time limit can end up to three seconds late because the bounded
-reap finishes first. Repeated cancellation does not restart its deadline. A child
-already started by a partly resumed root stays in the job, when enabled, and
-ends with that job; cleanup does not terminate the shared job or other commands.
-That can be the whole lifetime of the tool's process.
+reap finishes first. Repeated cancellation does not restart its deadline.
+On a failed resume, cleanup first ends the tree through the command's own job,
+then closes that handle and kills/reaps the root. It never ends the shared job
+or unrelated commands. Without a command job, root-only fallback cannot
+guarantee that a partly started child ends.
 
 CI has no WSL. A manual mechanism test on one Windows 11 PC (not a run of this
 implementation) found only the root in the job after a 0.3-second late
 assignment, versus all five Windows-side WSL processes in the job and ending on
 job close when the root was created suspended, assigned, and then resumed.
+
+### Windows command time limits and cancellation
+
+Each foreground command also gets its own Job Object while still suspended,
+after the optional module-wide job assignment. This second job has no
+kill-on-close flag. It is used to end only that command's tree at a time limit
+or cancellation, even when the host disabled the module-wide job. Cleanup
+closes the tool's pipe ends before a reap bounded to three seconds, without the
+old five-second wait for pipes held by descendants. A time limit or Stop ends
+background children started by this foreground command too on Windows.
+Previously Windows left those children running; Linux already ends them.
+Faults in root kill or pipe close are logged, but do not replace a timeout or
+swallow a person's Stop.
+
+On normal completion, closing this command handle does not end children.
+This preserves the existing behavior for a command that leaves a child running
+with redirected pipes. If a command job cannot be made or assigned (for example
+under a restrictive parent job), one warning reports root-only cleanup.
+The command still runs, including when a host's replacement factory raises an
+ordinary exception. A host can replace `_create_windows_command_job(pid)`
+with a callable returning `None` to disable this command-specific facility.
+The existing `_get_windows_job_object()` and `_assign_to_windows_job(pid)`
+overrides still control only the module-wide abrupt-exit job.
 
 ## Configuration
 
