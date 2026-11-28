@@ -91,10 +91,22 @@ async def test_incremental_output_stdin_eof_and_real_exit_code(tool):
         ),
     )
     process_id = started["process_id"]
-    first = await action(
-        tool, "wait", process_id=process_id, cursor=started["next_cursor"], wait_ms=5000
-    )
-    assert "ready" in text(started) + text(first)
+    # Output chunks are byte-stream pages, not lines. With python -u, print()
+    # can deliver the word and its newline in separate writes/pages.
+    first = started
+    ready_stdout = text(started)
+    ready_stderr = text(started, "stderr")
+    async with asyncio.timeout(5):
+        while "ready\n" not in ready_stdout:
+            first = await action(
+                tool,
+                "wait",
+                process_id=process_id,
+                cursor=first["next_cursor"],
+                wait_ms=1000,
+            )
+            ready_stdout += text(first)
+            ready_stderr += text(first, "stderr")
     assert first["state"] == "running"
     await action(
         tool, "write", process_id=process_id, stdin="hello\n", close_stdin=True
@@ -106,8 +118,8 @@ async def test_incremental_output_stdin_eof_and_real_exit_code(tool):
     remaining = await action(
         tool, "read", process_id=process_id, cursor=first["next_cursor"]
     )
-    assert text(remaining) == "got:hello\n"
-    assert text(remaining, "stderr") == "err\n"
+    assert ready_stdout + text(remaining) == "ready\ngot:hello\n"
+    assert ready_stderr + text(remaining, "stderr") == "err\n"
     assert (
         await action(
             tool, "read", process_id=process_id, cursor=remaining["next_cursor"]
