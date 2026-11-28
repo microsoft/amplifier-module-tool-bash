@@ -51,6 +51,7 @@ def _setup(monkeypatch, process, first):
         mod.asyncio, "create_subprocess_exec", AsyncMock(return_value=process)
     )
     monkeypatch.setattr(mod, "_assign_to_windows_job", lambda _: False)
+    monkeypatch.setattr(mod, "_create_windows_command_job", lambda _: None)
     monkeypatch.setattr(mod, "_resume_windows_process", MagicMock(side_effect=first))
     return tool
 
@@ -491,6 +492,7 @@ async def test_partial_resume_owned_child_holds_pipes_but_call_returns(
     )
     monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", partially_started)
     monkeypatch.setattr(mod, "_assign_to_windows_job", lambda _: False)
+    monkeypatch.setattr(mod, "_create_windows_command_job", lambda _: None)
     cause = "later Thread32Next failed (Windows error code 5)"
     monkeypatch.setattr(
         mod, "_resume_windows_process", MagicMock(side_effect=RuntimeError(cause))

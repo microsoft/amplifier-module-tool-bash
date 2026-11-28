@@ -19,6 +19,11 @@ import pytest
 import amplifier_module_tool_bash as mod
 
 
+@pytest.fixture(autouse=True)
+def no_real_command_job_for_fake_pids(monkeypatch):
+    monkeypatch.setattr(mod, "_create_windows_command_job", lambda pid: None)
+
+
 class _FakeProc:
     def __init__(self, events):
         self.pid = 424242
