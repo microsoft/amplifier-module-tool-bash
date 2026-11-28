@@ -72,6 +72,40 @@ Execute a bash command with platform-appropriate shell.
   (WSL, if both are installed), falling back to well-known Git-for-Windows
   install locations if `PATH` resolves nothing.
 
+### Windows orphan protection
+
+A Windows Job Object is a set of processes that Windows manages as one unit;
+kill-on-close makes Windows end its members when its last handle closes.
+Foreground Windows commands start suspended and are assigned to that job,
+then each verified command thread is resumed once, so
+children inherit job membership from birth.
+There is no process-table walk: recorded parent IDs can refer to unrelated
+processes after PID reuse, and creation-time comparisons are not ancestry proof
+when the clock changes or timestamps are equal. Job assignment is best effort
+(a host may disable the module's job); resume is still attempted when assignment
+fails. Previous suspend counts zero and one are accepted; a higher count or a
+resume failure makes the tool kill its new root and close its own pipe ends
+synchronously before creating a task or yielding. Only reaping is asynchronous,
+with a three-second limit independent of the command timeout. Cancellation of
+only the reap task cannot skip the kill/close or replace the original cause;
+unfinished reaping is reported.
+
+An original interrupt is re-raised after bounded cleanup. If a Stop arrives
+during cleanup after an ordinary resume error, the cause is logged and that Stop
+is raised after cleanup, so the caller does not continue, even when a loop
+shutdown cancels both the caller and the reap together. The caller's own
+cancellation count distinguishes that Stop from cancellation of only the reap.
+A caller's own time limit can end up to three seconds late because the bounded
+reap finishes first. Repeated cancellation does not restart its deadline. A child
+already started by a partly resumed root stays in the job, when enabled, and
+ends with that job; cleanup does not terminate the shared job or other commands.
+That can be the whole lifetime of the tool's process.
+
+CI has no WSL. A manual mechanism test on one Windows 11 PC (not a run of this
+implementation) found only the root in the job after a 0.3-second late
+assignment, versus all five Windows-side WSL processes in the job and ending on
+job close when the root was created suspended, assigned, and then resumed.
+
 ## Configuration
 
 ```toml

@@ -1,157 +1,234 @@
-"""Regression test: every Win32 ctypes call site declares argtypes/restype.
+"""Run real Win32 ctypes declaration/control flow with a fake DLL on every OS.
 
-## Why this test exists
-
-ctypes silently defaults an undeclared `restype`/`argtypes` to C `int`
-(32-bit signed). On 64-bit Windows, a HANDLE or pointer-sized value routed
-through that default gets truncated -- producing wrong results or memory
-corruption rather than a clean error. This is exactly the kind of bug that
-looks fine in review and only misbehaves on a real 64-bit Windows box.
-
-None of the existing suites exercise this class of bug on non-Windows CI:
-
-- `test_windows_job_call_sites.py` patches `_assign_to_windows_job` and
-  `_spawn_descendant_sweep` as whole functions, so the ctypes calls inside
-  them never run.
-- `test_gap013_windows_job_object_orphans.py` is `skipif`'d to
-  `sys.platform == "win32"`, so it executes nowhere in this repo's CI.
-
-That leaves the signature declarations for `CreateJobObjectW`,
-`SetInformationJobObject`, `OpenProcess`, `AssignProcessToJobObject`,
-`CreateToolhelp32Snapshot`, `Process32First`, `Process32Next`, and
-`CloseHandle` unverified anywhere except a real Windows machine.
-
-`ctypes.WinDLL` does not exist as a real attribute on non-Windows platforms
-(hence `create=True` below), but `ctypes.wintypes` is plain, portable
-`ctypes.Structure`/`c_*` aliasing that imports and behaves identically on
-any platform. That means the three Windows-only functions under test can
-run for real here -- only the DLL handle itself is a stand-in -- so this
-test drives the genuine signature-declaration code, not a paraphrase of it,
-and asserts that every Win32 function actually invoked had both `argtypes`
-and `restype` explicitly assigned. It runs on Linux, macOS, and CI, today.
+Windows CI also exercises real jobs and suspended starts. These tests guard
+pointer-sized signatures, thread-owner filtering and failure-path handle cleanup
+without assigning/resuming any live process. There is no process-table walk.
 """
 
 from __future__ import annotations
 
 import ctypes
-from unittest.mock import MagicMock, patch
+from ctypes import wintypes
+from unittest.mock import MagicMock, call
+
+import pytest
 
 import amplifier_module_tool_bash as mod
 
 
-def _assert_signature_declared(kernel32_mock: MagicMock, name: str) -> None:
-    fn = getattr(kernel32_mock, name)
-    assert fn.argtypes is not None, (
-        f"kernel32.{name} has no argtypes declared -- ctypes will default "
-        "arguments to C int, truncating a 64-bit pointer/HANDLE on 64-bit "
-        "Windows"
+def _assert_signature_declared(kernel32, name):
+    fn = getattr(kernel32, name)
+    # Do not let MagicMock's synthesized attributes impersonate declarations.
+    assert isinstance(vars(fn).get("argtypes"), list), name
+    assert "restype" in vars(fn), name
+    assert fn.restype is not None, name
+
+
+@pytest.fixture
+def kernel32(monkeypatch):
+    dll = MagicMock()
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *a, **k: dll, raising=False)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 18, raising=False)
+    monkeypatch.setattr(mod, "_windows_job_handle", None)
+    return dll
+
+
+def test_job_object_creation_declares_signatures(kernel32):
+    assert mod._get_windows_job_object() is not None
+    for name in ("CreateJobObjectW", "SetInformationJobObject", "CloseHandle"):
+        _assert_signature_declared(kernel32, name)
+
+
+def test_assign_to_job_declares_signatures(kernel32):
+    assert mod._assign_to_windows_job(4242) is True
+    for name in ("OpenProcess", "AssignProcessToJobObject", "CloseHandle"):
+        _assert_signature_declared(kernel32, name)
+
+
+@pytest.fixture
+def threads(kernel32):
+    # Foreign threads first, including an adjacent PID, to prove exact filtering.
+    entries = iter([(90, 400), (91, 4243), (92, 4242)])
+    kernel32.CreateToolhelp32Snapshot.return_value = 0x100000010
+    kernel32.OpenThread.return_value = 0x100000020
+    kernel32.GetProcessIdOfThread.return_value = 4242
+    kernel32.ResumeThread.return_value = 1
+
+    def next_entry(snapshot, pointer):
+        try:
+            tid, owner = next(entries)
+        except StopIteration:
+            return False
+        assert pointer._obj.dwSize == ctypes.sizeof(pointer._obj)
+        pointer._obj.th32ThreadID = tid
+        pointer._obj.th32OwnerProcessID = owner
+        return True
+
+    kernel32.Thread32First.side_effect = next_entry
+    kernel32.Thread32Next.side_effect = next_entry
+    return kernel32
+
+
+def test_resume_uses_thread_snapshot_exact_owner_minimal_rights_and_signatures(threads):
+    mod._resume_windows_process(4242)
+    threads.CreateToolhelp32Snapshot.assert_called_once_with(0x4, 0)
+    threads.OpenThread.assert_called_once_with(0x802, False, 92)
+    threads.GetProcessIdOfThread.assert_called_once_with(0x100000020)
+    threads.ResumeThread.assert_called_once_with(0x100000020)
+    assert threads.CloseHandle.call_args_list == [call(0x100000020), call(0x100000010)]
+    for name in (
+        "CreateToolhelp32Snapshot",
+        "Thread32First",
+        "Thread32Next",
+        "OpenThread",
+        "GetProcessIdOfThread",
+        "ResumeThread",
+        "CloseHandle",
+    ):
+        _assert_signature_declared(threads, name)
+    assert threads.CreateToolhelp32Snapshot.restype is wintypes.HANDLE
+    assert threads.OpenThread.restype is wintypes.HANDLE
+    assert threads.OpenThread.argtypes == [
+        wintypes.DWORD,
+        wintypes.BOOL,
+        wintypes.DWORD,
+    ]
+    assert threads.ResumeThread.restype is wintypes.DWORD
+    assert threads.ResumeThread.argtypes == [wintypes.HANDLE]
+    assert threads.GetProcessIdOfThread.restype is wintypes.DWORD
+    assert threads.GetProcessIdOfThread.argtypes == [wintypes.HANDLE]
+
+
+@pytest.mark.parametrize("invalid", [None, 0, ctypes.c_void_p(-1).value])
+def test_invalid_thread_snapshot_not_used_or_closed(kernel32, invalid):
+    kernel32.CreateToolhelp32Snapshot.return_value = invalid
+    with pytest.raises(
+        RuntimeError, match=r"CreateToolhelp32Snapshot.*Windows error code 18"
+    ):
+        mod._resume_windows_process(4242)
+    kernel32.Thread32First.assert_not_called()
+    kernel32.OpenThread.assert_not_called()
+    kernel32.CloseHandle.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "failure", ["empty", "no_owner", "open", "owner", "resume", "exception"]
+)
+def test_resume_failure_closes_only_acquired_handles(threads, failure):
+    if failure == "empty":
+        threads.Thread32First.side_effect = None
+        threads.Thread32First.return_value = False
+        cause = "Thread32First"
+    elif failure == "no_owner":
+        cause = "No thread found"
+    elif failure == "open":
+        threads.OpenThread.return_value = None
+        cause = "OpenThread"
+    elif failure == "resume":
+        threads.ResumeThread.return_value = 0xFFFFFFFF
+        cause = "ResumeThread"
+    elif failure == "owner":
+        threads.GetProcessIdOfThread.return_value = 0
+        cause = "GetProcessIdOfThread"
+    else:
+        threads.ResumeThread.side_effect = RuntimeError("DLL error")
+        cause = "DLL error"
+    with pytest.raises(RuntimeError, match=cause):
+        mod._resume_windows_process(7777 if failure == "no_owner" else 4242)
+    expected = [call(0x100000010)]
+    if failure in ("owner", "resume", "exception"):
+        expected.insert(0, call(0x100000020))
+    assert threads.CloseHandle.call_args_list == expected
+    if failure in ("empty", "no_owner"):
+        threads.OpenThread.assert_not_called()
+        threads.ResumeThread.assert_not_called()
+    if failure in ("open", "owner"):
+        threads.ResumeThread.assert_not_called()
+
+
+@pytest.mark.parametrize("count", [0, 1])
+def test_resume_accepts_previous_counts_zero_and_one(threads, count):
+    threads.ResumeThread.return_value = count
+    mod._resume_windows_process(4242)
+    threads.ResumeThread.assert_called_once_with(0x100000020)
+
+
+@pytest.mark.parametrize("count", [2, 3, 127])
+def test_resume_rejects_still_suspended_count_without_looping(threads, count):
+    threads.ResumeThread.return_value = count
+    with pytest.raises(RuntimeError, match=f"thread was suspended {count} times"):
+        mod._resume_windows_process(4242)
+    threads.ResumeThread.assert_called_once_with(0x100000020)
+    assert threads.CloseHandle.call_args_list == [call(0x100000020), call(0x100000010)]
+
+
+def test_reused_opened_thread_owner_is_not_resumed(threads):
+    threads.GetProcessIdOfThread.return_value = 7777
+    with pytest.raises(RuntimeError, match="No thread found"):
+        mod._resume_windows_process(4242)
+    threads.OpenThread.assert_called_once_with(0x802, False, 92)
+    threads.ResumeThread.assert_not_called()
+    assert threads.CloseHandle.call_args_list == [call(0x100000020), call(0x100000010)]
+
+
+def test_resumes_all_verified_threads_once_and_skips_reused_id(threads):
+    entries = iter([92, 93, 94])
+
+    def next_entry(snapshot, pointer):
+        try:
+            pointer._obj.th32ThreadID = next(entries)
+        except StopIteration:
+            return False
+        pointer._obj.th32OwnerProcessID = 4242
+        return True
+
+    threads.Thread32First.side_effect = next_entry
+    threads.Thread32Next.side_effect = next_entry
+    threads.OpenThread.side_effect = [1002, 1003, 1004]
+    threads.GetProcessIdOfThread.side_effect = [4242, 7777, 4242]
+    threads.ResumeThread.side_effect = [1, 0]
+    mod._resume_windows_process(4242)
+    assert threads.OpenThread.call_args_list == [
+        call(0x802, False, tid) for tid in (92, 93, 94)
+    ]
+    assert threads.GetProcessIdOfThread.call_args_list == [
+        call(handle) for handle in (1002, 1003, 1004)
+    ]
+    assert threads.ResumeThread.call_args_list == [call(1002), call(1004)]
+    assert threads.CloseHandle.call_args_list == [
+        call(handle) for handle in (1002, 1003, 1004, 0x100000010)
+    ]
+
+
+def test_thread_entry_type_cached_without_loading_windows_dll(monkeypatch):
+    monkeypatch.setattr(mod, "_windows_thread_entry_type", None)
+    dll = MagicMock(
+        side_effect=AssertionError("no DLL should load for type definition")
     )
-    assert fn.restype is not None, (
-        f"kernel32.{name} has no restype declared -- ctypes defaults the "
-        "return value to C int, truncating a 64-bit HANDLE on 64-bit "
-        "Windows"
-    )
+    monkeypatch.setattr(ctypes, "WinDLL", dll, raising=False)
+    first = mod._get_windows_thread_entry_type()
+    assert mod._get_windows_thread_entry_type() is first
+    assert mod._windows_thread_entry_type is first
+    assert issubclass(first, ctypes.Structure)
+    dll.assert_not_called()
 
 
-class TestWin32CallSignatures:
-    """Drives the real Windows-only functions with a mocked kernel32 DLL
-    handle so the signature declarations are exercised on any platform.
-    """
-
-    def setup_method(self) -> None:
-        # Module-level cache; must not leak between tests or across the
-        # rest of the suite.
-        self._saved_job_handle = mod._windows_job_handle
-        mod._windows_job_handle = None
-
-    def teardown_method(self) -> None:
-        mod._windows_job_handle = self._saved_job_handle
-
-    def test_job_object_creation_declares_signatures(self) -> None:
-        kernel32 = MagicMock(name="kernel32")
-        windll_factory = MagicMock(return_value=kernel32)
-
-        with (
-            patch("amplifier_module_tool_bash.sys.platform", "win32"),
-            patch.object(ctypes, "WinDLL", windll_factory, create=True),
-        ):
-            job = mod._get_windows_job_object()
-
-        assert job is not None, (
-            "job creation must succeed against a mocked, all-truthy kernel32"
-        )
-        for name in ("CreateJobObjectW", "SetInformationJobObject", "CloseHandle"):
-            _assert_signature_declared(kernel32, name)
-
-    def test_assign_to_job_declares_signatures(self) -> None:
-        kernel32 = MagicMock(name="kernel32")
-        windll_factory = MagicMock(return_value=kernel32)
-
-        with (
-            patch("amplifier_module_tool_bash.sys.platform", "win32"),
-            patch.object(ctypes, "WinDLL", windll_factory, create=True),
-        ):
-            assigned = mod._assign_to_windows_job(4242)
-
-        assert assigned is True, (
-            "assignment must succeed against a mocked, all-truthy kernel32"
-        )
-        for name in ("OpenProcess", "AssignProcessToJobObject", "CloseHandle"):
-            _assert_signature_declared(kernel32, name)
-
-    def test_descendant_enumeration_declares_signatures(self) -> None:
-        kernel32 = MagicMock(name="kernel32")
-        # Falsy on the first call ends the process-table walk immediately
-        # (simulates an empty/failed walk) -- a real MagicMock is truthy
-        # forever, which would otherwise spin the `while True` loop in
-        # `_enumerate_child_pids_windows` forever via `Process32Next`.
-        kernel32.Process32First.return_value = False
-        windll_factory = MagicMock(return_value=kernel32)
-
-        with (
-            patch("amplifier_module_tool_bash.sys.platform", "win32"),
-            patch.object(ctypes, "WinDLL", windll_factory, create=True),
-        ):
-            children = mod._enumerate_child_pids_windows(1234)
-
-        assert children == set()
-        # All four signatures are declared unconditionally before the walk
-        # begins, so this holds even though Process32Next is never reached.
-        for name in (
-            "CreateToolhelp32Snapshot",
-            "Process32First",
-            "Process32Next",
-            "CloseHandle",
-        ):
-            _assert_signature_declared(kernel32, name)
-
-    def test_snapshot_invalid_handle_value_is_treated_as_failure(self) -> None:
-        """CreateToolhelp32Snapshot signals failure via INVALID_HANDLE_VALUE,
-        i.e. `(HANDLE)-1` -- NOT NULL. With a HANDLE (c_void_p) restype,
-        ctypes converts that bit pattern to a large *positive* Python int
-        (18446744073709551615 on 64-bit) -- never to the Python literal -1
-        or to 0. A guard written as ``if snap in (-1, 0)`` therefore never
-        matches this real failure value and falls through to call
-        Process32First/CloseHandle on an invalid handle.
-
-        This test must fail against that old guard: with it restored, the
-        invalid-handle value is not caught, so both Process32First and
-        CloseHandle get called on the invalid handle below (Process32First
-        is stubbed to return False purely so the walk terminates instead of
-        spinning forever on an always-truthy MagicMock Process32Next --
-        it does NOT make the old guard correct).
-        """
-        kernel32 = MagicMock(name="kernel32")
-        kernel32.CreateToolhelp32Snapshot.return_value = ctypes.c_void_p(-1).value
-        kernel32.Process32First.return_value = False
-        windll_factory = MagicMock(return_value=kernel32)
-
-        with (
-            patch("amplifier_module_tool_bash.sys.platform", "win32"),
-            patch.object(ctypes, "WinDLL", windll_factory, create=True),
-        ):
-            children = mod._enumerate_child_pids_windows(1234)
-
-        assert children == set()
-        kernel32.Process32First.assert_not_called()
-        kernel32.CloseHandle.assert_not_called()
+@pytest.mark.parametrize(
+    "failure", ["snapshot", "first", "next", "open", "owner", "resume"]
+)
+def test_windows_api_failures_include_error_code(threads, monkeypatch, failure):
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
+    if failure == "snapshot":
+        threads.CreateToolhelp32Snapshot.return_value = None
+    elif failure == "first":
+        threads.Thread32First.side_effect = None
+        threads.Thread32First.return_value = False
+    elif failure == "open":
+        threads.OpenThread.return_value = None
+    elif failure == "owner":
+        threads.GetProcessIdOfThread.return_value = 0
+    elif failure == "resume":
+        threads.ResumeThread.return_value = 0xFFFFFFFF
+    with pytest.raises(RuntimeError, match="Windows error code 5"):
+        mod._resume_windows_process(4242)

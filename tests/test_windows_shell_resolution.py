@@ -396,7 +396,7 @@ class TestForegroundBackgroundAgree:
             ),
             patch("amplifier_module_tool_bash.subprocess.Popen", popen_mock),
             patch("amplifier_module_tool_bash._assign_to_windows_job", MagicMock()),
-            patch("amplifier_module_tool_bash._spawn_descendant_sweep", MagicMock()),
+            patch("amplifier_module_tool_bash._resume_windows_process", MagicMock()),
             patch.object(mod.subprocess, "DETACHED_PROCESS", 0x00000008, create=True),
             patch.object(
                 mod.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True

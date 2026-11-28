@@ -1,153 +1,434 @@
-"""Contract tests for Windows orphan-protection wiring.
+"""All-platform suspended-start contracts; fake the OS boundary, not the ordering.
 
-An independent review found the existing GAP-013 test drives
-``_assign_to_windows_job`` **directly**, bypassing ``_run_command`` entirely.
-That guards "does the raw ctypes wiring work" -- useful -- but not the contract
-the module actually promises: *every foreground subprocess this module spawns
-is assigned to the kill-on-close job*. If a refactor dropped one of the three
-call sites, or added a fourth path without the call, that suite would still
-pass.
-
-These tests close that gap, and deliberately run on **every** platform. The
-Windows-only test file needs a Windows box and there is no Windows CI in this
-repo, so its 3 tests execute nowhere automatically. Call-site wiring does not
-need a real kernel to verify -- patch ``sys.platform`` and the two helpers, and
-assert the real ``_run_command`` reaches them. That runs on Linux, on macOS, in
-CI, today.
+GAP-013/GAP-028 no longer uses a descendant walk. Both foreground Windows
+branches must assign before resume without an intervening await, and must still
+resume with a disabled or failing optional job. POSIX/background stay unchanged.
 """
 
 from __future__ import annotations
 
-from typing import Any
-from unittest.mock import AsyncMock
-from unittest.mock import MagicMock
-from unittest.mock import patch
+import ast
+import asyncio
+import inspect
+from pathlib import Path
+import textwrap
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from amplifier_module_tool_bash import BashTool
+
+import amplifier_module_tool_bash as mod
 
 
 class _FakeProc:
-    """Minimal stand-in for an asyncio subprocess."""
+    def __init__(self, events):
+        self.pid = 424242
+        self.returncode = None
+        self.events = events
+        self.killed = False
 
-    def __init__(self, pid: int = 424242) -> None:
-        self.pid = pid
-        self.returncode = 0
+    async def communicate(self):
+        self.events.append("communicate")
+        self.returncode = 7
+        return b"complete output", b"diagnostic"
 
-    async def communicate(self, *_: Any, **__: Any) -> tuple[bytes, bytes]:
-        return (b"ok", b"")
+    def kill(self):
+        self.events.append("kill")
+        self.killed = True
+        self.returncode = 1
 
-    async def wait(self) -> int:
-        return 0
-
-    def kill(self) -> None:  # pragma: no cover - not exercised here
-        pass
-
-
-@pytest.mark.asyncio
-async def test_windows_foreground_subprocess_is_job_assigned() -> None:
-    """The real _run_command must job-assign the PID it spawned.
-
-    Patches only the platform and the two Win32 helpers -- the command-dispatch
-    logic under test is the genuine article.
-    """
-    tool = BashTool({})
-    proc = _FakeProc()
-
-    with (
-        patch("amplifier_module_tool_bash.sys.platform", "win32"),
-        patch(
-            "amplifier_module_tool_bash._assign_to_windows_job", MagicMock()
-        ) as assign,
-        patch("amplifier_module_tool_bash._spawn_descendant_sweep", MagicMock()),
-        patch(
-            "amplifier_module_tool_bash.asyncio.create_subprocess_exec",
-            AsyncMock(return_value=proc),
-        ),
-        patch(
-            "amplifier_module_tool_bash.asyncio.create_subprocess_shell",
-            AsyncMock(return_value=proc),
-        ),
-        patch("amplifier_module_tool_bash.shutil.which", return_value="C:\\bash.exe"),
-    ):
-        await tool._run_command("echo hi", timeout=5)
-
-    assert assign.called, (
-        "_run_command spawned a foreground subprocess on Windows without "
-        "assigning it to the kill-on-close job object. That is the entire "
-        "orphan protection this module promises."
-    )
-    assert assign.call_args.args[0] == proc.pid, (
-        f"job assignment used {assign.call_args.args[0]!r}, not the spawned "
-        f"pid {proc.pid!r}"
-    )
+    async def wait(self):
+        self.events.append("reap")
+        # A missing kill must not be hidden by an immediately returning mock.
+        if not self.killed:
+            await asyncio.Event().wait()
+        return self.returncode
 
 
 @pytest.mark.asyncio
-async def test_posix_never_touches_the_windows_helpers() -> None:
-    """POSIX must take a byte-identical path to what shipped before.
+@pytest.mark.parametrize("is_wsl", [True, False], ids=["wsl", "gitbash"])
+@pytest.mark.parametrize("assignment", [True, False, "raises"])
+async def test_windows_create_assign_resume_order(monkeypatch, is_wsl, assignment):
+    events = []
+    proc = _FakeProc(events)
+    tool = mod.BashTool({})
+    monkeypatch.setattr(
+        tool, "_resolve_windows_bash", AsyncMock(return_value=("bash.exe", is_wsl))
+    )
+    monkeypatch.setattr(mod.sys, "platform", "win32")
 
-    The guard that matters most in this whole change: Linux, macOS and WSL
-    users currently work, and a Windows fix that reaches them is a net loss.
-    """
-    tool = BashTool({})
-    proc = _FakeProc()
+    async def create(*args, **kwargs):
+        events.append("create")
+        assert kwargs["creationflags"] & 0x4, "command must be born suspended"
+        assert kwargs["stdin"] == asyncio.subprocess.DEVNULL
+        assert args == (
+            ("wsl", "--exec", "bash", "-c", "echo hi")
+            if is_wsl
+            else ("bash.exe", "-c", "echo hi")
+        )
+        return proc
 
-    with (
-        patch("amplifier_module_tool_bash.sys.platform", "linux"),
-        patch(
-            "amplifier_module_tool_bash._assign_to_windows_job", MagicMock()
-        ) as assign,
-        patch(
-            "amplifier_module_tool_bash._spawn_descendant_sweep", MagicMock()
-        ) as sweep,
-        patch(
-            "amplifier_module_tool_bash.asyncio.create_subprocess_exec",
-            AsyncMock(return_value=proc),
+    def assign(pid):
+        assert pid == proc.pid
+        events.append("assign")
+        if assignment == "raises":
+            raise RuntimeError("host assignment failed")
+        return assignment
+
+    def resume(pid):
+        assert pid == proc.pid
+        events.append("resume")
+
+    monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", create)
+    # Replacements AFTER module import must be used: hosts disable the job here.
+    monkeypatch.setattr(mod, "_assign_to_windows_job", assign)
+    monkeypatch.setattr(mod, "_resume_windows_process", resume)
+    result = await asyncio.wait_for(tool._run_command("echo hi", timeout=30), 5)
+    assert events == ["create", "assign", "resume", "communicate"]
+    assert result["stdout"] == "complete output"
+    assert result["stderr"] == "diagnostic"
+    assert result["returncode"] == 7
+    assert not proc.killed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_wsl", [True, False], ids=["wsl", "gitbash"])
+@pytest.mark.parametrize("cause", ["No thread found", "ResumeThread failed"])
+async def test_failed_resume_kills_reaps_and_returns_error_without_hang(
+    monkeypatch, is_wsl, cause
+):
+    events = []
+    proc = _FakeProc(events)
+    tool = mod.BashTool({})
+    monkeypatch.setattr(
+        tool, "_resolve_windows_bash", AsyncMock(return_value=("bash.exe", is_wsl))
+    )
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(
+        mod.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)
+    )
+    monkeypatch.setattr(mod, "_assign_to_windows_job", lambda _: False)
+    monkeypatch.setattr(
+        mod, "_resume_windows_process", MagicMock(side_effect=RuntimeError(cause))
+    )
+    result = await asyncio.wait_for(tool._run_command("echo hi", timeout=30), 2)
+    assert events == ["kill", "reap"]
+    assert result == {
+        "stdout": "",
+        "stderr": f"Windows command could not resume: {cause}",
+        "stdout_raw": b"",
+        "stderr_raw": f"Windows command could not resume: {cause}".encode("utf-8"),
+        "returncode": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_execute_failed_resume_preserves_person_visible_cause(monkeypatch):
+    events = []
+    proc = _FakeProc(events)
+    tool = mod.BashTool({"safety_profile": "unrestricted"})
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(
+        tool, "_resolve_windows_bash", AsyncMock(return_value=("bash.exe", False))
+    )
+    monkeypatch.setattr(
+        mod.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)
+    )
+    monkeypatch.setattr(mod, "_assign_to_windows_job", lambda _: False)
+    cause = "ResumeThread failed (Windows error code 5)"
+    monkeypatch.setattr(
+        mod, "_resume_windows_process", MagicMock(side_effect=RuntimeError(cause))
+    )
+    result = await asyncio.wait_for(tool.execute({"command": "echo hi"}), 5)
+    assert result.success is False
+    assert isinstance(result.output, dict), result.output
+    assert cause in result.output["stderr"]
+    assert result.output["returncode"] == 1
+    assert events == ["kill", "reap"]
+
+
+@pytest.mark.asyncio
+async def test_execute_no_bash_preserves_person_visible_cause(monkeypatch):
+    tool = mod.BashTool({"safety_profile": "unrestricted"})
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(
+        tool, "_resolve_windows_bash", AsyncMock(return_value=(None, False))
+    )
+    result = await tool.execute({"command": "echo hi"})
+    assert result.success is False
+    assert isinstance(result.output, dict), result.output
+    assert result.output["stderr"] == mod._WINDOWS_NO_BASH_ERROR
+    assert result.output["returncode"] == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_decoded_only_result_uses_utf8_fallback(monkeypatch):
+    tool = mod.BashTool({"safety_profile": "unrestricted"})
+    monkeypatch.setattr(
+        tool,
+        "_run_command",
+        AsyncMock(
+            return_value={
+                "stdout": "caf\u00e9",
+                "stderr": "cause \u00e9",
+                "returncode": 1,
+            }
         ),
-        patch(
-            "amplifier_module_tool_bash.asyncio.create_subprocess_shell",
-            AsyncMock(return_value=proc),
-        ),
+    )
+    result = await tool.execute({"command": "echo hi"})
+    assert result.success is False
+    assert result.output == {
+        "stdout": "caf\u00e9",
+        "stderr": "cause \u00e9",
+        "returncode": 1,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "interrupt_type", [KeyboardInterrupt, SystemExit, asyncio.CancelledError]
+)
+@pytest.mark.parametrize("failure_site", ["assign", "resume"])
+async def test_interrupt_kills_reaps_then_reraises(
+    monkeypatch, interrupt_type, failure_site
+):
+    events = []
+    proc = _FakeProc(events)
+    tool = mod.BashTool({})
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(
+        tool, "_resolve_windows_bash", AsyncMock(return_value=("bash.exe", False))
+    )
+    monkeypatch.setattr(
+        mod.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)
+    )
+    interrupt = interrupt_type("stop")
+    monkeypatch.setattr(
+        mod,
+        "_assign_to_windows_job",
+        MagicMock(side_effect=interrupt)
+        if failure_site == "assign"
+        else lambda _: False,
+    )
+    resume = (
+        MagicMock(side_effect=interrupt) if failure_site == "resume" else MagicMock()
+    )
+    monkeypatch.setattr(mod, "_resume_windows_process", resume)
+    # Catch in this same coroutine; an unhandled KeyboardInterrupt in a separate
+    # asyncio task would stop pytest's loop instead of testing the contract.
+    with pytest.raises(interrupt_type) as raised:
+        await tool._run_command("echo hi", timeout=30)
+    assert raised.value is interrupt
+    assert events == ["kill", "reap"]
+    if failure_site == "assign":
+        resume.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_failed_resume_already_exited_process_is_still_reaped(monkeypatch):
+    events = []
+    proc = _FakeProc(events)
+    proc.killed = True
+    proc.returncode = 1
+
+    def gone():
+        events.append("kill")
+        raise ProcessLookupError("already ended")
+
+    proc.kill = gone
+    tool = mod.BashTool({})
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(
+        tool, "_resolve_windows_bash", AsyncMock(return_value=("bash.exe", False))
+    )
+    monkeypatch.setattr(
+        mod.asyncio, "create_subprocess_exec", AsyncMock(return_value=proc)
+    )
+    monkeypatch.setattr(mod, "_assign_to_windows_job", lambda _: False)
+    monkeypatch.setattr(
+        mod,
+        "_resume_windows_process",
+        MagicMock(side_effect=RuntimeError("resume failed")),
+    )
+    result = await asyncio.wait_for(tool._run_command("echo hi", timeout=30), 5)
+    assert events == ["kill", "reap"]
+    assert result["stderr"] == "Windows command could not resume: resume failed"
+    assert result["stderr_raw"] == result["stderr"].encode("utf-8")
+    assert result["returncode"] == 1
+
+
+def test_get_job_entry_point_is_looked_up_at_call_time(monkeypatch):
+    # The REAL assign function must consult the replacement get-job function.
+    get_job = MagicMock(return_value=None)
+    resume = MagicMock()
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(mod, "_get_windows_job_object", get_job)
+    monkeypatch.setattr(mod, "_resume_windows_process", resume)
+    proc = _FakeProc([])
+    mod._assign_and_resume_windows_process(proc)
+    get_job.assert_called_once_with()
+    resume.assert_called_once_with(proc.pid)
+
+
+def test_helper_and_post_spawn_path_have_no_await():
+    helper = ast.parse(
+        textwrap.dedent(inspect.getsource(mod._assign_and_resume_windows_process))
+    )
+    assert not any(
+        isinstance(node, (ast.Await, ast.AsyncFunctionDef)) for node in ast.walk(helper)
+    )
+    # Also guard the call's arguments, not merely the gap before its start.
+    _assert_no_await_before_resume(inspect.getsource(mod.BashTool._run_command))
+
+
+def _assert_no_await_before_resume(source):
+    run = ast.parse(textwrap.dedent(source))
+    create = next(
+        node
+        for node in ast.walk(run)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Await)
+        and isinstance(node.value.value, ast.Call)
+        and getattr(node.value.value.func, "attr", "") == "create_subprocess_exec"
+    )
+    resume = next(
+        node
+        for node in ast.walk(run)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_assign_and_resume_windows_process"
+    )
+    assert create.lineno < resume.lineno
+    after_create = (create.end_lineno, create.end_col_offset)
+    through_resume = (resume.end_lineno, resume.end_col_offset)
+    assert not any(
+        isinstance(node, ast.Await)
+        and after_create < (node.lineno, node.col_offset) < through_resume
+        for node in ast.walk(run)
+    )
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        "await asyncio.sleep(0); _assign_and_resume_windows_process(process)",
+        "_assign_and_resume_windows_process(await something(process))",
+    ],
+    ids=["same-line-await", "await-in-helper-argument"],
+)
+def test_no_await_guard_rejects_yields_through_end_of_call(call):
+    source = (
+        "async def run():\n"
+        "    process = await asyncio.create_subprocess_exec('command')\n"
+        f"    {call}\n"
+    )
+    with pytest.raises(AssertionError):
+        _assert_no_await_before_resume(source)
+
+
+def _assert_failed_start_kill_and_close_before_tasks_or_await(source):
+    run = ast.parse(textwrap.dedent(source))
+    handler = next(
+        node
+        for node in ast.walk(run)
+        if isinstance(node, ast.ExceptHandler)
+        and isinstance(node.type, ast.Name)
+        and node.type.id == "BaseException"
+    )
+    kill = next(
+        node
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "kill"
+    )
+    close = next(
+        node
+        for node in ast.walk(handler)
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "close"
+    )
+    after_close = (close.end_lineno, close.end_col_offset)
+    assert (kill.lineno, kill.col_offset) < after_close
+    for node in ast.walk(handler):
+        if isinstance(node, ast.Await) or (
+            isinstance(node, ast.Call)
+            and getattr(node.func, "attr", "") in ("create_task", "ensure_future")
+        ):
+            assert (node.lineno, node.col_offset) > after_close
+    reap = ast.parse(textwrap.dedent(inspect.getsource(mod._reap_failed_windows_start)))
+    assert not any(
+        isinstance(node, ast.Call)
+        and getattr(node.func, "attr", "") in ("kill", "close")
+        for node in ast.walk(reap)
+    ), "root kill/pipe close may not be delegated to the reap coroutine"
+
+
+def test_failed_start_kill_and_close_are_synchronous_before_task_creation():
+    _assert_failed_start_kill_and_close_before_tasks_or_await(
+        inspect.getsource(mod.BashTool._run_command)
+    )
+
+
+@pytest.mark.parametrize(
+    "before_kill",
+    ["await asyncio.sleep(0)", "asyncio.create_task(something())"],
+    ids=["await-before-kill", "task-before-kill"],
+)
+def test_failed_start_order_guard_rejects_async_work_before_kill(before_kill):
+    source = inspect.getsource(mod.BashTool._run_command)
+    assert source.count("process.kill()") == 1
+    source = source.replace("process.kill()", f"{before_kill}; process.kill()")
+    with pytest.raises(AssertionError):
+        _assert_failed_start_kill_and_close_before_tasks_or_await(source)
+
+
+def test_no_windows_process_table_walk_or_time_ancestry():
+    for name in (
+        "_protect_windows_descendants",
+        "_spawn_descendant_sweep",
+        "_enumerate_child_pids_windows",
+        "_windows_sweep_tasks",
+        "_open_windows_process",
+        "_verified_windows_child",
+        "_WindowsProcessIdentity",
+        "_WINDOWS_SWEEP_MAX_PROCESSES",
     ):
-        await tool._run_command("echo hi", timeout=5)
+        assert not hasattr(mod, name), name
+    for path in Path(mod.__file__).parent.rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        for forbidden in (
+            "TH32CS_SNAPPROCESS",
+            "Process32First",
+            "Process32Next",
+            "GetProcessTimes",
+            "NtResumeProcess",
+        ):
+            assert forbidden not in source, (path, forbidden)
 
-    assert not assign.called, (
-        "a Windows job-object helper ran on POSIX -- the platform guard leaks"
-    )
-    assert not sweep.called, (
-        "the Windows descendant sweep ran on POSIX -- the platform guard leaks"
-    )
+
+@pytest.mark.asyncio
+async def test_posix_never_touches_windows_helpers(monkeypatch):
+    tool = mod.BashTool({})
+    proc = _FakeProc([])
+    assign = MagicMock()
+    resume = MagicMock()
+    monkeypatch.setattr(mod.sys, "platform", "linux")
+    monkeypatch.setattr(mod, "_assign_to_windows_job", assign)
+    monkeypatch.setattr(mod, "_assign_and_resume_windows_process", resume)
+    create = AsyncMock(return_value=proc)
+    monkeypatch.setattr(mod.asyncio, "create_subprocess_shell", create)
+    await tool._run_command("echo hi", timeout=30)
+    assign.assert_not_called()
+    resume.assert_not_called()
+    assert "creationflags" not in create.call_args.kwargs
 
 
-def test_job_failure_is_reported_loudly_once_not_silently() -> None:
-    """An environmental job failure must be visible, and must not spam.
-
-    Before this, every failure was ``logger.debug`` and every caller discarded
-    the return value, so the protection could be entirely inert under a
-    restrictive parent job object -- the normal state on CI runners and in
-    Windows containers -- with no operator-visible signal whatsoever.
-    """
-    import amplifier_module_tool_bash as mod
-
+def test_job_failure_is_reported_loudly_once_not_silently():
     original = mod._windows_job_failure_reported
     try:
         mod._windows_job_failure_reported = False
         with patch.object(mod, "logger") as log:
             mod._report_windows_job_failure("first failure (%s)", "boom")
             mod._report_windows_job_failure("second failure (%s)", "boom")
-
-        assert log.warning.call_count == 1, (
-            f"expected exactly one warning, got {log.warning.call_count}. "
-            "Zero means the failure is invisible; more than one means every "
-            "command spams and people learn to ignore it."
-        )
-        assert log.debug.call_count == 1, (
-            "subsequent failures should still be recorded at debug level"
-        )
-        warned = log.warning.call_args.args[0]
-        assert "NOT active" in warned, (
-            f"warning does not state the protection is inactive: {warned!r}"
-        )
+        assert log.warning.call_count == 1
+        assert log.debug.call_count == 1
+        assert "NOT active" in log.warning.call_args.args[0]
     finally:
         mod._windows_job_failure_reported = original

@@ -191,23 +191,27 @@ def _signal_pids(pids: set[int], sig: int) -> None:
 # spawned here has no way to notice its parent is gone and no code of ours
 # runs to clean it up.
 #
-# Confirmed empirically (adversarial Windows re-test, alienware-r13):
-# spawning `sleep 60` via this module's WSL-routed path
-# (`wsl --exec bash -c ...`), then killing ONLY the top-level `amplifier.exe`
-# PID (no /T, no console Ctrl+C -- a plain `Stop-Process -Id <pid>`), left
-# the resulting `wsl.exe -> wsl.exe -> wslhost.exe` chain running with a
-# dead parent for the entire 60+ second observation window. This directly
-# contradicts the prior claim that killing only the top-level PID always
-# brings the whole tree down within ~2s -- that was true for amplifier's own
-# internal python-to-python self-relaunch (which IS covered by an existing
-# job-object association), but not for tool-call subprocesses spawned from
-# deep inside a running turn, which were never assigned to that job.
+# A Windows Job Object is a set of processes that Windows manages as one unit.
+# Kill-on-close makes Windows end its members when its last handle closes.
+# GAP-013/GAP-028: assigning a running command is too late to cover children
+# already born outside the job. A process-table walk is unsafe: recorded parent
+# IDs survive exit and can refer to foreign processes after ID reuse; creation
+# times do not prove ancestry either (wall-clock adjustments and equal ticks).
 #
-# Fix: create one Windows Job Object per process, with
-# JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE set, and assign every subprocess this
-# module spawns (on the foreground/tracked path only -- NOT
-# `_run_command_background`, whose whole point is to outlive us) to that
-# job. The job's only handle lives in this process; when this process ends
+# A manual Windows 11 measurement with real WSL found only the root in the job
+# when assigned 0.3s after start, with four Windows-side children outside it.
+# Creating the root suspended, assigning it, then resuming put all five in the
+# job and all ended on job close (mechanism evidence from one PC, not this code).
+# CI has no WSL; that result was measured by hand, not with this implementation.
+#
+# Fix: create foreground commands SUSPENDED, assign to the process-wide job,
+# then resume each verified thread once, so Windows propagates job membership
+# from birth. A previous suspend count above one fails rather than leaving the
+# command suspended; kill/reap it and report the cause. No process-table
+# walk, and no change to background/managed paths. A host already owning a job
+# may replace _get_windows_job_object and _assign_to_windows_job to disable this
+# extra job; both remain module-global entry points looked up at call time.
+# The job's only handle lives in this process; when this process ends
 # for ANY reason -- including a forceful kill that runs none of our own
 # Python cleanup code -- the OS closes that handle and the kernel itself
 # tears down every process still assigned to the job. This does not depend
@@ -219,15 +223,6 @@ _windows_job_handle = None
 # currently calls off the event-loop thread, so this was latent, but a
 # module-level construction costs nothing and removes the trap.
 _windows_job_lock = threading.Lock()
-
-# Background descendant-sweep tasks, held so the event loop cannot garbage
-# collect them mid-flight. asyncio.create_task returns a task that is only
-# weakly referenced by the loop; the docs are explicit that an unreferenced task
-# "may get garbage collected at any time, even before it's done". These sweeps
-# are the entire GAP-013/GAP-028 protection for WSL descendants, and if one
-# vanished the symptom would be indistinguishable from a silent assignment
-# failure.
-_windows_sweep_tasks: set = set()
 
 # One-shot flag so a job-object failure is reported loudly ONCE per process
 # rather than either spamming every command or (as before) being invisible.
@@ -391,9 +386,8 @@ def _get_windows_job_object():
 def _assign_to_windows_job(pid: int) -> bool:
     """Best-effort: assign `pid` to this process's kill-on-close job object.
 
-    Returns whether assignment actually succeeded. Most callers only need
-    "did I do my best" semantics and can ignore the return value; the
-    descendant-walker below (GAP-013/GAP-028) uses it to log clearly.
+    Returns whether assignment actually succeeded. Foreground commands are
+    suspended until this attempt finishes, then resumed even if it fails.
 
     Failure is intentionally swallowed as far as the CALLER's control flow
     goes (logged at debug only) -- this is defense-in-depth cleanup, not a
@@ -463,168 +457,163 @@ def _assign_to_windows_job(pid: int) -> bool:
         return False
 
 
-def _enumerate_child_pids_windows(parent_pid: int) -> set[int]:
-    """Direct children of `parent_pid` via CreateToolhelp32Snapshot -- a
-    plain Win32 API walk of the system-wide process snapshot, filtered by
-    th32ParentProcessID. No WMI/CIM, no PowerShell subprocess.
+_windows_thread_entry_type = None
 
-    Windows-only. Returns an empty set on any failure or on other platforms.
-    """
-    if sys.platform != "win32":
-        return set()
-    try:
-        import ctypes
-        from ctypes import wintypes
 
-        TH32CS_SNAPPROCESS = 0x00000002
-        # CreateToolhelp32Snapshot signals failure by returning
-        # INVALID_HANDLE_VALUE, i.e. (HANDLE)-1 -- NOT NULL. With restype
-        # HANDLE (c_void_p), ctypes converts NULL to None and any other
-        # pointer value, including the -1 bit pattern, to a positive Python
-        # int (18446744073709551615 on 64-bit). Compare against the real
-        # sentinel, not the signed literal -1.
-        _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+def _get_windows_thread_entry_type():
+    """Cache the ctypes type, without loading any Windows DLL at import time."""
+    global _windows_thread_entry_type
+    if _windows_thread_entry_type is not None:
+        return _windows_thread_entry_type
+    import ctypes
+    from ctypes import wintypes
 
-        class PROCESSENTRY32(ctypes.Structure):
-            _fields_ = [
-                ("dwSize", wintypes.DWORD),
-                ("cntUsage", wintypes.DWORD),
-                ("th32ProcessID", wintypes.DWORD),
-                ("th32DefaultHeapID", ctypes.c_size_t),
-                ("th32ModuleID", wintypes.DWORD),
-                ("cntThreads", wintypes.DWORD),
-                ("th32ParentProcessID", wintypes.DWORD),
-                ("pcPriClassBase", ctypes.c_long),
-                ("dwFlags", wintypes.DWORD),
-                ("szExeFile", ctypes.c_char * 260),
-            ]
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        # Same reasoning as the job-object signatures above: CreateToolhelp32Snapshot
-        # returns a HANDLE, and leaving restype undeclared truncates it to a 32-bit
-        # c_int on 64-bit Windows. Declare all four signatures explicitly.
-        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
-        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
-        kernel32.Process32First.restype = wintypes.BOOL
-        kernel32.Process32First.argtypes = [
-            wintypes.HANDLE,
-            ctypes.POINTER(PROCESSENTRY32),
+    class THREADENTRY32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ThreadID", wintypes.DWORD),
+            ("th32OwnerProcessID", wintypes.DWORD),
+            ("tpBasePri", wintypes.LONG),
+            ("tpDeltaPri", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
         ]
-        kernel32.Process32Next.restype = wintypes.BOOL
-        kernel32.Process32Next.argtypes = [
-            wintypes.HANDLE,
-            ctypes.POINTER(PROCESSENTRY32),
-        ]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
-        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-        if snap is None or snap == _INVALID_HANDLE_VALUE:
-            return set()
-        try:
-            entry = PROCESSENTRY32()
-            entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
-            children: set[int] = set()
-            if not kernel32.Process32First(snap, ctypes.byref(entry)):
-                return set()
-            while True:
-                if entry.th32ParentProcessID == parent_pid:
-                    children.add(entry.th32ProcessID)
-                if not kernel32.Process32Next(snap, ctypes.byref(entry)):
-                    break
-            return children
-        finally:
-            kernel32.CloseHandle(snap)
-    except Exception as e:  # pragma: no cover - defense in depth only
-        logger.debug(
-            "tool-bash: descendant enumeration failed for %s (%s)", parent_pid, e
-        )
-        return set()
+    _windows_thread_entry_type = THREADENTRY32
+    return THREADENTRY32
 
 
-def _spawn_descendant_sweep(root_pid: int) -> None:
-    """Start the descendant sweep and KEEP A REFERENCE to the task.
+def _resume_windows_process(pid: int) -> None:
+    """Resume each verified command thread once; fail if any remains suspended.
 
-    ``asyncio.create_task`` returns a task the loop holds only weakly. The
-    stdlib docs are explicit: "Save a reference to the result of this
-    function... A task that isn't referenced elsewhere may get garbage
-    collected at any time, even before it's done."
-
-    These sweeps are the whole GAP-013/GAP-028 protection for WSL descendants
-    (inner ``wsl.exe``, ``wslhost.exe``), which do NOT inherit job membership
-    from the immediate spawned PID. If one were collected mid-flight, the
-    symptom would be orphaned processes with nothing in the logs -- outwardly
-    identical to a silent job-assignment failure, and correspondingly awful to
-    diagnose.
-
-    In practice the task is always parked on ``asyncio.sleep``, so the loop's
-    timer structures probably keep it reachable. "Probably" is not a property
-    worth betting a process-cleanup guarantee on, and a set costs nothing.
+    Only a THREAD snapshot is used. The caller must still own the newly spawned
+    process, with no intervening await, so the owner PID cannot have been reused.
+    Thread IDs can be reused, so verify the opened handle's owner too. Counts
+    zero and one are accepted; higher counts fail without repeatedly resuming.
     """
-    task = asyncio.create_task(_protect_windows_descendants(root_pid))
-    _windows_sweep_tasks.add(task)
-    task.add_done_callback(_windows_sweep_tasks.discard)
+    import ctypes
+    from ctypes import wintypes
 
+    THREADENTRY32 = _get_windows_thread_entry_type()
 
-async def _protect_windows_descendants(root_pid: int) -> None:
-    """Best-effort background task (GAP-013/GAP-028): assign every
-    descendant of `root_pid` to the same kill-on-close job object, not
-    just the immediate spawned PID.
+    def failed(cause: str) -> RuntimeError:
+        return RuntimeError(f"{cause} (Windows error code {ctypes.get_last_error()})")
 
-    Why this exists: `_assign_to_windows_job(process.pid)` alone was found
-    NOT to actually protect a WSL-routed command's real descendants.
-    Verified directly against the deployed code with the Win32
-    `IsProcessInJob` query (native Windows, alienware-r13): after spawning
-    `wsl --exec bash -c <cmd>` and calling `_assign_to_windows_job()` on
-    the immediate PID, that top-level PID *was* a job member -- but the
-    inner `wsl.exe` and `wslhost.exe` processes underneath it (the ones
-    that do the actual work, and the ones this module's own comments
-    elsewhere claim are covered) were NOT. Windows only auto-propagates
-    job membership to children spawned directly by a job-member process
-    via CreateProcess; WSL's inner process tree is connected to the outer
-    `wsl.exe` via an RPC/session channel rather than a plain parent-child
-    CreateProcess relationship, so it never inherits membership that way.
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.Thread32First.restype = wintypes.BOOL
+    kernel32.Thread32First.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(THREADENTRY32),
+    ]
+    kernel32.Thread32Next.restype = wintypes.BOOL
+    kernel32.Thread32Next.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(THREADENTRY32),
+    ]
+    kernel32.OpenThread.restype = wintypes.HANDLE
+    kernel32.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.GetProcessIdOfThread.restype = wintypes.DWORD
+    kernel32.GetProcessIdOfThread.argtypes = [wintypes.HANDLE]
+    kernel32.ResumeThread.restype = wintypes.DWORD
+    kernel32.ResumeThread.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
-    An external kill of the top-level process was still observed (same
-    investigation) to bring the whole WSL tree down in practice -- but via
-    WSL's own connection-teardown behavior when its client disconnects,
-    not via the job object. That is a real, currently-working mechanism,
-    but it is undocumented, owned by WSL rather than by us, and not
-    something this module actually controls or could adjust if it ever
-    changed. This function makes the protection deliberate instead of
-    coincidental: it walks the process tree (root_pid's children, and
-    their children) with a few short retries -- the WSL tree takes a
-    moment to fully spawn -- and assigns every PID it finds to the job
-    too, so the kill-on-close guarantee no longer depends on an external,
-    unverified assumption about WSL's behavior.
-
-    Fire-and-forget: runs concurrently with the command's own
-    process.communicate(), never blocks or delays the tool call, and
-    never raises (every failure path is caught and logged at debug only,
-    same contract as _assign_to_windows_job itself).
-    """
-    if sys.platform != "win32":
-        return
+    TH32CS_SNAPTHREAD = 0x00000004
+    THREAD_SUSPEND_RESUME = 0x0002
+    THREAD_QUERY_LIMITED_INFORMATION = 0x0800
+    snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0)
+    if not snapshot or snapshot == ctypes.c_void_p(-1).value:
+        raise failed("CreateToolhelp32Snapshot for command threads failed")
     try:
-        seen: set[int] = {root_pid}
-        for _ in range(8):  # poll for up to ~2s while the tree spawns
-            frontier = list(seen)
-            new_found = False
-            for pid in frontier:
-                for child in _enumerate_child_pids_windows(pid):
-                    if child not in seen:
-                        seen.add(child)
-                        _assign_to_windows_job(child)
-                        new_found = True
-            if not new_found and len(seen) > 1:
-                break  # tree grew at least once, then stopped changing
-            await asyncio.sleep(0.25)
-    except Exception as e:  # pragma: no cover - defense in depth only
-        logger.debug(
-            "tool-bash: descendant job-protection sweep failed for %s (%s)",
-            root_pid,
-            e,
+        entry = THREADENTRY32()
+        entry.dwSize = ctypes.sizeof(entry)
+        if not kernel32.Thread32First(snapshot, ctypes.byref(entry)):
+            raise failed("Thread32First found no command thread")
+        resumed = False
+        while True:
+            if entry.th32OwnerProcessID == pid:
+                thread = kernel32.OpenThread(
+                    THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+                    False,
+                    entry.th32ThreadID,
+                )
+                if not thread:
+                    raise failed("OpenThread for suspended command failed")
+                try:
+                    owner = kernel32.GetProcessIdOfThread(thread)
+                    if not owner:
+                        raise failed("GetProcessIdOfThread for command thread failed")
+                    if owner == pid:
+                        previous_count = kernel32.ResumeThread(thread)
+                        if previous_count == 0xFFFFFFFF:
+                            raise failed("ResumeThread for suspended command failed")
+                        if previous_count > 1:
+                            # Deliberate: if another program adds a suspension
+                            # to every new command, every command fails here.
+                            # We must not remove suspensions owned by that actor.
+                            raise RuntimeError(
+                                f"The command's thread was suspended {previous_count} "
+                                "times; it is still suspended after one resume"
+                            )
+                        resumed = True
+                    # A mismatched handle belongs to a reused thread ID. Close
+                    # and skip it, never resume a thread of a foreign process.
+                finally:
+                    kernel32.CloseHandle(thread)
+            if not kernel32.Thread32Next(snapshot, ctypes.byref(entry)):
+                if ctypes.get_last_error() != 18:  # ERROR_NO_MORE_FILES
+                    raise failed("Thread32Next for command threads failed")
+                break
+        if not resumed:
+            raise RuntimeError(f"No thread found for suspended command PID {pid}")
+    finally:
+        kernel32.CloseHandle(snapshot)
+
+
+def _assign_and_resume_windows_process(process: asyncio.subprocess.Process) -> None:
+    """Assign before running; resume even if the optional job is disabled/fails.
+
+    Look up the job entry point as a module global each time: hosts replace it
+    (and _get_windows_job_object, called by it) when they already own the job.
+    This synchronous helper has no await. Immediately after create_subprocess_exec
+    returns, asyncio still holds the process handle, preventing PID reuse until
+    assignment and resume finish without yielding back to the event loop.
+    """
+    try:
+        _assign_to_windows_job(process.pid)
+    except Exception as e:
+        logger.debug("tool-bash: job assignment failed before resume (%s)", e)
+    _resume_windows_process(process.pid)
+
+
+_WINDOWS_START_CLEANUP_TIMEOUT_SECONDS = 3.0
+
+
+async def _reap_failed_windows_start(
+    process: asyncio.subprocess.Process,
+) -> str | None:
+    """Only wait, independently bounded; root kill/pipe close already ran.
+
+    A partly resumed command may already have started a child holding the pipes.
+    Do NOT close/terminate the module-wide job: it can contain other commands.
+    Such a child remains in that job (when enabled) and ends with the job.
+    That can be the whole lifetime of the tool's process.
+    """
+    try:
+        await asyncio.wait_for(
+            process.wait(), timeout=_WINDOWS_START_CLEANUP_TIMEOUT_SECONDS
         )
+    except TimeoutError:
+        return (
+            "Command cleanup did not finish within "
+            f"{_WINDOWS_START_CLEANUP_TIMEOUT_SECONDS:g} seconds; stopped waiting"
+        )
+    except Exception as error:
+        return f"Command cleanup could not reap the root: {error}"
+    return None
 
 
 # --- Windows shell resolution: Git Bash discoverability + observability --
@@ -1266,23 +1255,32 @@ Constraints:
                 # Execute command and wait for completion
                 result = await self._run_command(command, timeout=timeout)
 
+                # Synthetic/older error paths may provide only decoded text.
+                # Preserve their cause rather than replacing it with KeyError.
+                stdout_raw = result.get("stdout_raw")
+                if stdout_raw is None:
+                    stdout_raw = result["stdout"].encode("utf-8", errors="replace")
+                stderr_raw = result.get("stderr_raw")
+                if stderr_raw is None:
+                    stderr_raw = result["stderr"].encode("utf-8", errors="replace")
+
                 # Decode, withholding binary BEFORE truncating. Truncation
                 # bounds a single call but not a session: a binary payload
                 # still costs tens of thousands of tokens of noise per call
                 # after truncation, so a few dozen such calls exhaust even a
                 # 1M-token context.
                 stdout, stdout_binary = self._guard_binary_output(
-                    result["stdout_raw"], stream="stdout"
+                    stdout_raw, stream="stdout"
                 )
                 stderr, stderr_binary = self._guard_binary_output(
-                    result["stderr_raw"], stream="stderr"
+                    stderr_raw, stream="stderr"
                 )
 
                 # True sizes as produced by the subprocess. Taken before
                 # truncation and independently of decoding, so a lossy decode
                 # (U+FFFD is 3 bytes for a 1-byte input) cannot inflate them.
-                stdout_bytes = len(result["stdout_raw"])
-                stderr_bytes = len(result["stderr_raw"])
+                stdout_bytes = len(stdout_raw)
+                stderr_bytes = len(stderr_raw)
 
                 # Apply output truncation to prevent context overflow
                 stdout, stdout_truncated, _ = self._truncate_output(stdout)
@@ -1690,41 +1688,99 @@ Constraints:
                 if is_wsl:
                     # WSL bash: Use 'wsl --exec bash -c' to prevent premature
                     # variable expansion by the WSL launcher
-                    process = await asyncio.create_subprocess_exec(
-                        "wsl",
-                        "--exec",
-                        "bash",
-                        "-c",
-                        command,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        stdin=asyncio.subprocess.DEVNULL,  # Never hand the child our stdin
-                        cwd=self.working_dir,
-                    )
-                    # GAP-024: assign to a kill-on-close job object so this
-                    # (and its wslhost.exe descendants) can't outlive an
-                    # amplifier.exe that gets killed outright rather than
-                    # cancelled through our own code. See helper docstring.
-                    _assign_to_windows_job(process.pid)
-                    # GAP-013/GAP-028: the immediate wsl.exe PID being a job
-                    # member does NOT mean its real descendants (inner
-                    # wsl.exe, wslhost.exe) are -- verified directly with
-                    # IsProcessInJob. Sweep for them in the background; see
-                    # _protect_windows_descendants docstring for why.
-                    _spawn_descendant_sweep(process.pid)
+                    args = ["wsl", "--exec", "bash", "-c", command]
                 else:
                     # Git Bash or other: Direct exec with [bash, -c, command]
-                    process = await asyncio.create_subprocess_exec(
-                        bash_exe,
-                        "-c",
-                        command,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        stdin=asyncio.subprocess.DEVNULL,  # Never hand the child our stdin
-                        cwd=self.working_dir,
+                    args = [bash_exe, "-c", command]
+                process = await asyncio.create_subprocess_exec(
+                    *args,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    stdin=asyncio.subprocess.DEVNULL,  # Never hand the child our stdin
+                    cwd=self.working_dir,
+                    creationflags=0x00000004,  # CREATE_SUSPENDED
+                )
+                # No await before assignment AND resume finish: asyncio still
+                # holds the process handle, so this new PID cannot be reused.
+                try:
+                    _assign_and_resume_windows_process(process)
+                except BaseException as e:
+                    # Do this synchronously BEFORE creating any task or yielding:
+                    # loop shutdown can directly cancel even a shielded task
+                    # before its first step. The job may be disabled by a host.
+                    cleanup_notes = []
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass  # already ended externally; still reap our handle
+                    except Exception as error:
+                        cleanup_notes.append(
+                            f"Command cleanup could not kill the root: {error}"
+                        )
+                    finally:
+                        # Process has no public close API. Close our transport
+                        # ends, not descendant-held ends. In CPython 3.11 to 3.13
+                        # a pending wait() otherwise also waits for pipe EOF.
+                        transport = getattr(process, "_transport", None)
+                        if transport is not None:
+                            try:
+                                transport.close()
+                            except Exception as error:
+                                cleanup_notes.append(
+                                    "Command cleanup could not close local pipes: "
+                                    f"{error}"
+                                )
+                    # Only reaping is asynchronous. Do not close the shared job;
+                    # it can hold other commands. Its children can remain until
+                    # that job closes, possibly the tool process's whole life.
+                    reap = asyncio.create_task(_reap_failed_windows_start(process))
+                    caller = asyncio.current_task()
+                    cancellation_count = (
+                        caller.cancelling() if caller is not None else 0
                     )
-                    _assign_to_windows_job(process.pid)  # GAP-024, see above
-                    _spawn_descendant_sweep(process.pid)
+                    cancellation_received = None
+                    while not reap.done():
+                        try:
+                            await asyncio.shield(reap)
+                        except asyncio.CancelledError as cancellation:
+                            # Only the caller's own count distinguishes Stop from
+                            # reap-only cancellation. Both tasks can be cancelled
+                            # in the same turn (including event-loop shutdown).
+                            if (
+                                caller is not None
+                                and caller.cancelling() > cancellation_count
+                                and cancellation_received is None
+                            ):
+                                cancellation_received = cancellation
+                            continue
+                    if reap.cancelled():
+                        cleanup_notes.append(
+                            "Command cleanup did not finish: reap task was cancelled"
+                        )
+                    else:
+                        reap_note = reap.result()
+                        if reap_note:
+                            cleanup_notes.append(reap_note)
+                    cleanup_note = "; ".join(cleanup_notes)
+                    if not isinstance(e, Exception):
+                        if cleanup_note:
+                            e.add_note(cleanup_note)
+                        raise
+                    message = f"Windows command could not resume: {e}"
+                    if cleanup_note:
+                        message += f". {cleanup_note}"
+                    if cancellation_received is not None:
+                        # A person's Stop must stop the caller after bounded
+                        # cleanup, not become an ordinary failed command result.
+                        logger.warning("%s", message)
+                        raise cancellation_received
+                    return {
+                        "stdout": "",
+                        "stderr": message,
+                        "stdout_raw": b"",
+                        "stderr_raw": message.encode("utf-8"),
+                        "returncode": 1,
+                    }
             else:
                 # No bash found on Windows. This tool's entire contract is
                 # POSIX shell semantics (quoting, tilde expansion, &&/||/|,
