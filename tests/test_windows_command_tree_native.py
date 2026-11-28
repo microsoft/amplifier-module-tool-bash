@@ -51,7 +51,14 @@ async def wait_file(path, timeout=20):
 @pytest.mark.asyncio
 async def test_normal_command_preserves_redirected_child(tmp_path, module_job):
     marker = tmp_path / "child-finished"
-    child = f"import time; from pathlib import Path; time.sleep(1); Path({str(marker)!r}).write_text('survived', encoding='utf-8')"
+    release = tmp_path / "release-child"
+    child = (
+        "import time\nfrom pathlib import Path\n"
+        "deadline = time.monotonic() + 30\n"
+        f"while not Path({str(release)!r}).exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.02)\n"
+        f"Path({str(marker)!r}).write_text('survived', encoding='utf-8')\n"
+    )
     parent = (
         "import subprocess,sys; "
         f"subprocess.Popen([sys.executable,'-c',{child!r}], "
@@ -60,11 +67,15 @@ async def test_normal_command_preserves_redirected_child(tmp_path, module_job):
     )
     tool = mod.BashTool({"working_dir": str(tmp_path)})
     tool._windows_bash_resolved = (sys._base_executable, False)
-    result = await asyncio.wait_for(tool._run_command(parent, timeout=30), 40)
-    assert result["returncode"] == 7
-    assert result["stdout"].splitlines() == ["parent-output"]
-    assert result["stderr"] == ""
-    assert not marker.exists(), "child must still be running at normal return"
+    try:
+        result = await asyncio.wait_for(tool._run_command(parent, timeout=30), 40)
+        assert result["returncode"] == 7
+        assert result["stdout"].splitlines() == ["parent-output"]
+        assert result["stderr"] == ""
+        assert not marker.exists(), "child must still be running at normal return"
+    finally:
+        # Release only AFTER normal return. No scheduler-dependent sleep window.
+        release.write_text("go", encoding="utf-8")
     await wait_file(marker)
     assert marker.read_text(encoding="utf-8") == "survived"
 
