@@ -106,6 +106,24 @@ implementation) found only the root in the job after a 0.3-second late
 assignment, versus all five Windows-side WSL processes in the job and ending on
 job close when the root was created suspended, assigned, and then resumed.
 
+### Windows command time limits and cancellation
+
+Each foreground command also gets its own Job Object while still suspended,
+after the optional module-wide job assignment. This second job has no
+kill-on-close flag. It is used to end only that command's tree at a time limit
+or cancellation, even when the host disabled the module-wide job. Cleanup
+closes the tool's pipe ends before a bounded reap, without the old five-second
+wait for pipes held by descendants.
+
+On normal completion, closing this command handle does not end children.
+This preserves the existing behavior for a command that leaves a child running
+with redirected pipes. If a command job cannot be made or assigned (for example
+under a restrictive parent job), one warning reports root-only cleanup.
+The command still runs. A host can replace `_create_windows_command_job(pid)`
+with a callable returning `None` to disable this command-specific facility.
+The existing `_get_windows_job_object()` and `_assign_to_windows_job(pid)`
+overrides still control only the module-wide abrupt-exit job.
+
 ## Configuration
 
 ```toml

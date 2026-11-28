@@ -573,6 +573,114 @@ def _resume_windows_process(pid: int) -> None:
         kernel32.CloseHandle(snapshot)
 
 
+_windows_command_job_failure_reported = False
+
+
+def _report_windows_command_job_failure(cause) -> None:
+    """Warn once if command-specific tree cleanup is unavailable."""
+    global _windows_command_job_failure_reported
+    if not _windows_command_job_failure_reported:
+        _windows_command_job_failure_reported = True
+        logger.warning(
+            "tool-bash: Windows command-tree cleanup unavailable (%s); "
+            "timeouts/cancellation fall back to ending the root only",
+            cause,
+        )
+    else:
+        logger.debug("tool-bash: Windows command-tree cleanup unavailable (%s)", cause)
+
+
+class _WindowsCommandJob:
+    """Owned tree handle. No kill-on-close: normal completion preserves children."""
+
+    def __init__(self, handle, kernel32):
+        self.handle = handle
+        self.kernel32 = kernel32
+
+    def terminate(self) -> bool:
+        if self.handle is None:
+            return False
+        try:
+            if self.kernel32.TerminateJobObject(self.handle, 1):
+                return True
+            _report_windows_command_job_failure("TerminateJobObject failed")
+        except Exception as error:
+            _report_windows_command_job_failure(error)
+        return False
+
+    def close(self) -> None:
+        if self.handle is not None:
+            handle, self.handle = self.handle, None
+            try:
+                if not self.kernel32.CloseHandle(handle):
+                    _report_windows_command_job_failure(
+                        "CloseHandle for command job failed"
+                    )
+            except Exception as error:
+                _report_windows_command_job_failure(error)
+
+
+def _create_windows_command_job(pid: int) -> _WindowsCommandJob | None:
+    """Assign the still-suspended command to a private job, or warn/fall back.
+
+    A Windows Job Object is a set of processes managed as one unit. This job
+    has NO kill-on-close flag. A host may replace this module-global entry point
+    with a callable returning None to disable command-specific tree cleanup too.
+    It is independent of the optional module-wide abrupt-host-exit job.
+    """
+    if sys.platform != "win32":
+        return None
+    job = None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        kernel32.TerminateJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        job = kernel32.CreateJobObjectW(None, None)
+        if not job:
+            raise OSError(
+                f"CreateJobObjectW: Windows error code {ctypes.get_last_error()}"
+            )
+        # AssignProcessToJobObject requires SET_QUOTA | TERMINATE, not all access.
+        process = kernel32.OpenProcess(0x0100 | 0x0001, False, pid)
+        if not process:
+            raise OSError(f"OpenProcess: Windows error code {ctypes.get_last_error()}")
+        try:
+            if not kernel32.AssignProcessToJobObject(job, process):
+                raise OSError(
+                    "AssignProcessToJobObject: Windows error code "
+                    f"{ctypes.get_last_error()}"
+                )
+        finally:
+            kernel32.CloseHandle(process)
+        owned = _WindowsCommandJob(job, kernel32)
+        job = None
+        return owned
+    except Exception as error:
+        _report_windows_command_job_failure(error)
+        return None
+    finally:
+        if job:
+            kernel32.CloseHandle(job)
+
+
+def _close_windows_command_job(process) -> None:
+    job = getattr(process, "_tool_bash_command_job", None)
+    if job is not None:
+        process._tool_bash_command_job = None
+        job.close()
+
+
 def _assign_and_resume_windows_process(process: asyncio.subprocess.Process) -> None:
     """Assign before running; resume even if the optional job is disabled/fails.
 
@@ -586,7 +694,30 @@ def _assign_and_resume_windows_process(process: asyncio.subprocess.Process) -> N
         _assign_to_windows_job(process.pid)
     except Exception as e:
         logger.debug("tool-bash: job assignment failed before resume (%s)", e)
-    _resume_windows_process(process.pid)
+    # Nest only after the optional module-wide job, but before any thread runs.
+    # Both are module-global lookups: a host can disable either independently.
+    process._tool_bash_command_job = _create_windows_command_job(process.pid)
+    try:
+        _resume_windows_process(process.pid)
+    except BaseException:
+        _close_windows_command_job(process)
+        raise
+
+
+def _terminate_windows_command(process) -> None:
+    """End only this command's tree; close local pipes without waiting for EOF."""
+    job = getattr(process, "_tool_bash_command_job", None)
+    terminated = job.terminate() if job is not None else False
+    try:
+        if not terminated:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+    finally:
+        transport = getattr(process, "_transport", None)
+        if transport is not None:
+            transport.close()
 
 
 _WINDOWS_START_CLEANUP_TIMEOUT_SECONDS = 3.0
@@ -790,6 +921,14 @@ async def _cleanup_process_tree(
       - reap via communicate()
     """
 
+    if is_windows:
+        _terminate_windows_command(process)
+        if reap:
+            note = await _reap_failed_windows_start(process)
+            if note:
+                logger.warning("tool-bash: %s", note)
+        return
+
     if pgid is not None and not is_windows:
         # Walk /proc for descendants BEFORE killing anything.
         descendant_pids = _find_descendant_pids(process.pid)
@@ -842,20 +981,36 @@ async def _await_process_tree_cleanup(
     the bounded cleanup task finishes, then raise CancelledError.
     """
 
-    cleanup_task = asyncio.create_task(
-        _cleanup_process_tree(process, pgid=pgid, is_windows=is_windows)
-    )
+    if is_windows:
+        # End the tree before task creation/yield. Loop shutdown can cancel a
+        # newly scheduled task before its first step, even through a shield.
+        _terminate_windows_command(process)
+        cleanup_task = asyncio.create_task(_reap_failed_windows_start(process))
+    else:
+        cleanup_task = asyncio.create_task(
+            _cleanup_process_tree(process, pgid=pgid, is_windows=is_windows)
+        )
+    caller = asyncio.current_task()
+    cancellation_count = caller.cancelling() if caller is not None else 0
     cancellation_received = False
 
     while not cleanup_task.done():
         try:
             await asyncio.shield(cleanup_task)
         except asyncio.CancelledError:
-            cancellation_received = True
+            if not is_windows or (
+                caller is not None and caller.cancelling() > cancellation_count
+            ):
+                cancellation_received = True
             continue
         except Exception as cleanup_error:  # noqa: BLE001
             logger.error("Process cleanup failed: %s", cleanup_error)
             break
+
+    if is_windows and not cleanup_task.cancelled() and cleanup_task.done():
+        note = cleanup_task.result()
+        if note:
+            logger.warning("tool-bash: %s", note)
 
     if cancellation_received:
         raise asyncio.CancelledError()
@@ -1869,3 +2024,6 @@ Constraints:
             # until the bounded cleanup task finishes.
             await _await_process_tree_cleanup(process, pgid=pgid, is_windows=is_windows)
             raise
+        finally:
+            if is_windows:
+                _close_windows_command_job(process)
