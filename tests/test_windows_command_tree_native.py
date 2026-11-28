@@ -93,27 +93,32 @@ def git_bash_tool(tmp_path):
 async def test_git_bash_ends_tree_before_late_effect(tmp_path, module_job, reason):
     ready = tmp_path / "command-ready"
     late = tmp_path / "must-not-appear"
+    # Allow slow Git Bash startup. Measure cleanup delay from the tool limit,
+    # not from an assumption that the ready marker appears inside one second.
+    limit = 10 if reason == "timeout" else 30
+    sleep_seconds = 15 if reason == "timeout" else 6
     command = (
         f"printf ready > {shlex.quote(ready.as_posix())}; "
-        f"sleep 6; printf late > {shlex.quote(late.as_posix())}"
+        f"sleep {sleep_seconds}; printf late > {shlex.quote(late.as_posix())}"
     )
     tool = git_bash_tool(tmp_path)
-    task = asyncio.create_task(
-        tool._run_command(command, timeout=1 if reason == "timeout" else 30)
-    )
+    task = asyncio.create_task(tool._run_command(command, timeout=limit))
     start = time.monotonic()
     try:
-        await wait_file(ready)
         if reason == "cancel":
+            await wait_file(ready)
             start = time.monotonic()
             task.cancel("native command cancellation")
         with pytest.raises(
             TimeoutError if reason == "timeout" else asyncio.CancelledError
         ):
-            await asyncio.wait_for(task, 5)
-        assert time.monotonic() - start < 4.5, "old five-second pipe wait returned"
+            await asyncio.wait_for(task, limit + 5 if reason == "timeout" else 5)
+        elapsed = time.monotonic() - start
+        extra = elapsed - limit if reason == "timeout" else elapsed
+        assert extra < 4.5, "old five-second pipe wait returned"
+        assert ready.exists(), "command never reached ready within the generous limit"
         # Wait past the entire finite command; an orphan must not write later.
-        await asyncio.sleep(9)
+        await asyncio.sleep(sleep_seconds + 3 if reason == "timeout" else 9)
         assert not late.exists(), "timed-out/cancelled command tree kept running"
     finally:
         if not task.done():

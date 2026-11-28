@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import ctypes
 from ctypes import wintypes
+import inspect
+import textwrap
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
@@ -216,6 +219,12 @@ async def test_failed_resume_closes_new_job_and_keeps_existing_bounded_cleanup(
         with pytest.raises(asyncio.CancelledError):
             await tool._run_command("echo hi", timeout=30)
     assert "kill-root" in events and "reap" in events
+    assert (
+        events.index("terminate-tree")
+        < events.index("job-close")
+        < events.index("kill-root")
+    )
+    job.terminate.assert_called_once_with()
     job.close.assert_called_once_with()
     assert process._tool_bash_command_job is None
 
@@ -245,11 +254,13 @@ async def test_tree_ended_before_cleanup_task_can_be_cancelled(monkeypatch):
     tool, process, job, events = setup_command(monkeypatch)
     process.communicate = AsyncMock(side_effect=TimeoutError())
     create_task = asyncio.create_task
+    reaps = []
 
     def cancel_reap(coro, *args, **kwargs):
         if coro.cr_code.co_name == "_reap_failed_windows_start":
             assert "terminate-tree" in events and "pipes-close" in events
             task = create_task(coro, *args, **kwargs)
+            reaps.append(task)
             task.cancel()
             return task
         return create_task(coro, *args, **kwargs)
@@ -258,6 +269,8 @@ async def test_tree_ended_before_cleanup_task_can_be_cancelled(monkeypatch):
     with pytest.raises(TimeoutError):
         await tool._run_command("long command", timeout=30)
     job.close.assert_called_once_with()
+    assert len(reaps) == 1
+    assert reaps[0].cancelled()
 
 
 @pytest.mark.asyncio
@@ -291,3 +304,257 @@ def test_native_termination_failure_warns_and_returns_false(kernel32, caplog, fa
     assert job.terminate() is False
     assert "root only" in caplog.text
     job.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["timeout", "cancel"])
+@pytest.mark.parametrize("fault", ["kill", "close"])
+async def test_cleanup_fault_preserves_execute_timeout_or_stop(
+    monkeypatch, caplog, reason, fault
+):
+    tool, process, job, events = setup_command(
+        monkeypatch, job_available=fault == "close"
+    )
+    process.communicate = AsyncMock(
+        side_effect=TimeoutError()
+        if reason == "timeout"
+        else asyncio.CancelledError("Stop")
+    )
+    if fault == "kill":
+        process.kill = MagicMock(side_effect=PermissionError("root access denied"))
+        cause = "root access denied"
+    else:
+        process._transport.close.side_effect = RuntimeError("pipe close failed")
+        cause = "pipe close failed"
+    waiting, release = asyncio.Event(), asyncio.Event()
+
+    async def blocked_wait():
+        waiting.set()
+        await release.wait()
+
+    process.wait = blocked_wait
+    monkeypatch.setattr(mod, "_WINDOWS_START_CLEANUP_TIMEOUT_SECONDS", 0.02)
+    next_steps = []
+
+    async def caller():
+        result = await tool.execute({"command": "echo hi", "timeout": 1})
+        next_steps.append(result)
+        return result
+
+    task = asyncio.create_task(caller())
+    try:
+        done, _ = await asyncio.wait({task}, timeout=2)
+        assert task in done, "faulted cleanup must keep its independent bound"
+        assert waiting.is_set()
+        if reason == "cancel":
+            assert task.cancelled(), "cleanup failure swallowed Stop"
+            assert next_steps == []
+        else:
+            result = task.result()
+            assert not result.success
+            assert result.output == "Command timed out after 1 seconds"
+        assert cause in caplog.text
+        assert "cleanup did not finish within" in caplog.text
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_stop_during_windows_reap_is_deferred_then_propagated(monkeypatch):
+    tool, process, job, events = setup_command(monkeypatch)
+    process.communicate = AsyncMock(side_effect=TimeoutError())
+    waiting, release = asyncio.Event(), asyncio.Event()
+
+    async def wait():
+        waiting.set()
+        await release.wait()
+        events.append("reap-finished")
+
+    process.wait = wait
+    monkeypatch.setattr(mod, "_WINDOWS_START_CLEANUP_TIMEOUT_SECONDS", 0.5)
+    next_steps = []
+
+    async def caller():
+        await tool.execute({"command": "echo hi", "timeout": 1})
+        next_steps.append("must not run")
+
+    task = asyncio.create_task(caller())
+    try:
+        await asyncio.wait_for(waiting.wait(), 2)
+        task.cancel("Stop during Windows reap")
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert "terminate-tree" in events and "pipes-close" in events
+        release.set()
+        done, _ = await asyncio.wait({task}, timeout=2)
+        assert task in done and task.cancelled()
+        assert "reap-finished" in events
+        assert next_steps == []
+        job.close.assert_called_once_with()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_host_command_factory_exception_is_best_effort(monkeypatch, caplog):
+    tool, process, job, events = setup_command(monkeypatch)
+    monkeypatch.setattr(mod, "_windows_command_job_failure_reported", False)
+    monkeypatch.setattr(
+        mod,
+        "_create_windows_command_job",
+        MagicMock(side_effect=RuntimeError("host replacement failed")),
+    )
+    result = await tool._run_command("echo hi", timeout=30)
+    assert result["stdout"] == "output" and result["returncode"] == 7
+    assert events == [
+        "create-suspended",
+        "module-assign-disabled",
+        "resume",
+        "communicate",
+    ]
+    assert process._tool_bash_command_job is None
+    assert "host replacement failed" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind", [KeyboardInterrupt, SystemExit, asyncio.CancelledError]
+)
+async def test_host_command_factory_interrupt_kills_reaps_and_reraises(
+    monkeypatch, kind
+):
+    tool, process, job, events = setup_command(monkeypatch)
+    first = kind("factory interrupted")
+    monkeypatch.setattr(
+        mod, "_create_windows_command_job", MagicMock(side_effect=first)
+    )
+    with pytest.raises(kind) as raised:
+        await tool._run_command("echo hi", timeout=30)
+    assert raised.value is first
+    assert events == [
+        "create-suspended",
+        "module-assign-disabled",
+        "kill-root",
+        "pipes-close",
+        "reap",
+    ]
+    job.close.assert_not_called()
+
+
+def assert_windows_termination_precedes_async_work(source):
+    tree = ast.parse(textwrap.dedent(source))
+    windows = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "is_windows"
+    )
+    nodes = [node for statement in windows.body for node in ast.walk(statement)]
+    direct_calls = [
+        statement.value
+        for statement in windows.body
+        if isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.Call)
+        and getattr(statement.value.func, "id", "") == "_terminate_windows_command"
+    ]
+    assert len(direct_calls) == 1, (
+        "termination must be direct, not inside an async task"
+    )
+    terminate = direct_calls[0]
+    end = (terminate.end_lineno, terminate.end_col_offset)
+    for node in nodes:
+        if isinstance(node, ast.Await) or (
+            isinstance(node, ast.Call)
+            and getattr(node.func, "attr", "") in ("create_task", "ensure_future")
+        ):
+            assert (node.lineno, node.col_offset) > end
+        assert not (
+            isinstance(node, ast.Call)
+            and getattr(node.func, "id", "") == "_cleanup_process_tree"
+        )
+
+
+def test_windows_timeout_termination_is_before_any_task_or_await():
+    assert_windows_termination_precedes_async_work(
+        inspect.getsource(mod._await_process_tree_cleanup)
+    )
+    # This POSIX helper must not be an alternative Windows path that hides an
+    # asynchronous termination; it has no Windows caller in the package.
+    source = inspect.getsource(mod._cleanup_process_tree)
+    assert "_terminate_windows_command" not in source
+
+
+@pytest.mark.parametrize(
+    "prefix", ["await asyncio.sleep(0); ", "asyncio.create_task(something()); "]
+)
+def test_windows_termination_order_guard_rejects_async_work(prefix):
+    source = inspect.getsource(mod._await_process_tree_cleanup)
+    source = source.replace(
+        "_terminate_windows_command(process)",
+        prefix + "_terminate_windows_command(process)",
+    )
+    with pytest.raises(AssertionError):
+        assert_windows_termination_precedes_async_work(source)
+
+
+def test_asyncio_run_shutdown_timeout_tree_ended_before_reap_first_step(monkeypatch):
+    saved = {}
+
+    async def main():
+        tool, process, job, events = setup_command(monkeypatch)
+        # Inject expiry synchronously so the real execute/_run_command timeout
+        # handler reaches reap creation in its first step. Only the timer/OS
+        # boundary is faked; asyncio.run shutdown cancels every pending task.
+        wait_for = asyncio.wait_for
+
+        async def timeout_communicate(awaitable, timeout):
+            if timeout == 1:
+                awaitable.close()
+                raise TimeoutError()
+            return await wait_for(awaitable, timeout)
+
+        monkeypatch.setattr(mod.asyncio, "wait_for", timeout_communicate)
+        create_task = asyncio.create_task
+        reaps = []
+
+        def record(coro, *args, **kwargs):
+            task = create_task(coro, *args, **kwargs)
+            if coro.cr_code.co_name == "_reap_failed_windows_start":
+                reaps.append(task)
+            return task
+
+        monkeypatch.setattr(mod.asyncio, "create_task", record)
+
+        async def wait():
+            saved["reap_started"] = True
+            await asyncio.Event().wait()
+
+        process.wait = wait
+        next_steps = []
+
+        async def caller():
+            await tool.execute({"command": "echo hi", "timeout": 1})
+            next_steps.append("must not run")
+
+        task = create_task(caller())
+        saved.update(
+            process=process,
+            job=job,
+            events=events,
+            task=task,
+            reaps=reaps,
+            next_steps=next_steps,
+        )
+        # Return immediately; the caller first step runs before the loop-stop
+        # callback, and its newly created reap first step runs after that stop.
+
+    asyncio.run(main())
+    assert "terminate-tree" in saved["events"] and "pipes-close" in saved["events"]
+    assert len(saved["reaps"]) == 1 and saved["reaps"][0].cancelled()
+    assert not saved.get("reap_started", False)
+    assert saved["task"].cancelled()
+    assert saved["next_steps"] == []
+    saved["job"].close.assert_called_once_with()
